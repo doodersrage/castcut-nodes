@@ -44,7 +44,7 @@ has the pack and which version, installs it with ComfyUI-Manager when it can, re
 (after asking, and only when its queue is empty), or hands you a copy-paste command for your
 setup. See [docs/castcut-nodes.md](https://github.com/doodersrage/castcut/blob/main/docs/castcut-nodes.md).
 
-1. **ComfyUI-Manager by name** (once the pack is in the Comfy Registry): Manager → Custom Nodes
+1. **ComfyUI-Manager by name** (from the Comfy Registry): Manager → Custom Nodes
    Manager → search *Castcut nodes* → Install; or `comfy node install castcut-nodes`.
 
 2. **ComfyUI-Manager → Install via Git URL**: `https://github.com/doodersrage/castcut-nodes`. Manager
