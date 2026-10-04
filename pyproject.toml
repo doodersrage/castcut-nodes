@@ -19,7 +19,7 @@ Documentation = "https://github.com/doodersrage/castcut/blob/main/docs/castcut-n
 
 [tool.comfy]
 # Placeholder: the Comfy Registry publisher id you create at https://registry.comfy.org.
-PublisherId = "your-publisher-id"
+PublisherId = "doodersrage"
 DisplayName = "Castcut nodes"
 Icon = ""
 includes = []
