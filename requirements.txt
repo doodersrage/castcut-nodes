@@ -1,0 +1,3 @@
+# ComfyUI already has both; nothing else is needed (cv2 and insightface are used when present).
+numpy
+pillow

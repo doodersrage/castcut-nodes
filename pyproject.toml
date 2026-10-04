@@ -1,0 +1,25 @@
+# Comfy Registry metadata (https://docs.comfy.org/registry/specifications). The pack is published
+# from a standalone copy of this folder: scripts/castcut-nodes-release.sh. Keep `version` equal to
+# CASTCUT_VERSION in castcut_nodes.py (tests/test_castcut.py checks it).
+[project]
+name = "castcut-nodes"
+description = "Castcut's post-render checks inside the ComfyUI job: pose score (DWPose limb angles + posture), best-of-two pick, face distance, matte repair and a report the Castcut app reads from /history."
+version = "1.1.0"
+license = { file = "LICENSE" }
+readme = "README.md"
+requires-python = ">=3.9"
+# ComfyUI already ships both; listed so a standalone install says what it imports.
+dependencies = ["numpy", "pillow"]
+classifiers = ["Operating System :: OS Independent"]
+
+[project.urls]
+Repository = "https://github.com/doodersrage/castcut-nodes"
+Documentation = "https://github.com/doodersrage/castcut/blob/main/docs/castcut-nodes.md"
+"Bug Tracker" = "https://github.com/doodersrage/castcut-nodes/issues"
+
+[tool.comfy]
+# Placeholder: the Comfy Registry publisher id you create at https://registry.comfy.org.
+PublisherId = "your-publisher-id"
+DisplayName = "Castcut nodes"
+Icon = ""
+includes = []
