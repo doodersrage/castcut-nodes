@@ -111,6 +111,11 @@ placeholder until a publisher exists). `scripts/castcut-nodes-release.sh <dir>` 
 the licence and a standalone README note into `<dir>`, ready to push as its own repository and
 publish with `comfy node publish`.
 
+Publishing: push a `v<version>` tag to the standalone repository and
+`.github/workflows/publish.yml` runs the tests, checks the tag matches `pyproject.toml` and
+`CASTCUT_VERSION`, and publishes with Comfy's publish action (repository secret
+`REGISTRY_ACCESS_TOKEN`, a publisher API key from registry.comfy.org).
+
 ## Tests
 
 Plain Python, no ComfyUI or torch:

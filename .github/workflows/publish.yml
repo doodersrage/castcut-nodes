@@ -1,0 +1,52 @@
+# Publish castcut-nodes to the Comfy Registry when a version tag is pushed (v1.4.0, …).
+# Runs in the standalone repository (github.com/doodersrage/castcut-nodes); in the Castcut repo
+# this file only rides along under comfyui-nodes/castcut/ and is copied by
+# scripts/castcut-nodes-release.sh.
+#
+# Needs the repository secret REGISTRY_ACCESS_TOKEN: a publisher API key from
+# https://registry.comfy.org (publisher doodersrage → API keys).
+name: Publish to Comfy Registry
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Tests and version
+    runs-on: ubuntu-latest
+    if: github.repository == 'doodersrage/castcut-nodes'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install numpy pillow
+      - run: python -m unittest discover -s tests
+      - name: The tag is the pack's version
+        if: github.ref_type == 'tag'
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' pyproject.toml)"
+          code="$(sed -n 's/^CASTCUT_VERSION = "\(.*\)"$/\1/p' castcut_nodes.py)"
+          if [ "v$version" != "${GITHUB_REF_NAME}" ] || [ "$version" != "$code" ]; then
+            echo "Tag ${GITHUB_REF_NAME}, pyproject.toml $version, castcut_nodes.py $code — they must agree."
+            exit 1
+          fi
+
+  publish:
+    name: Publish
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: Comfy-Org/publish-node-action@1.0.1
+        with:
+          personal_access_token: ${{ secrets.REGISTRY_ACCESS_TOKEN }}
