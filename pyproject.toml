@@ -3,8 +3,8 @@
 # CASTCUT_VERSION in castcut_nodes.py (tests/test_castcut.py checks it).
 [project]
 name = "castcut-nodes"
-description = "Castcut's post-render checks inside the ComfyUI job: pose score (DWPose limb angles + posture), best-of-two pick, face distance, matte repair and a report the Castcut app reads from /history."
-version = "1.1.0"
+description = "Castcut's checks inside ComfyUI: in-job pose score and best-of-two pick, matte repair, and HTTP routes that answer face, pose and two-person pose checks on the CPU without waiting for the render queue, plus input-folder clean-up and health for the Castcut app."
+version = "1.4.0"
 license = { file = "LICENSE" }
 readme = "README.md"
 requires-python = ">=3.9"

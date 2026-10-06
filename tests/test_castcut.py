@@ -298,5 +298,264 @@ class Registration(unittest.TestCase):
         self.assertEqual(package.__version__, castcut.CASTCUT_VERSION)
 
 
+
+class RouteHelperTests(unittest.TestCase):
+    """The pure parts of the HTTP routes (castcut_nodes.py, "HTTP routes")."""
+
+    def test_routes_are_not_registered_outside_comfyui(self):
+        self.assertFalse(castcut.ROUTES_REGISTERED)
+        self.assertEqual(castcut.info_payload()["version"], castcut.CASTCUT_VERSION)
+
+    def test_safe_ref_path_stays_inside_the_folder(self):
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, "day"))
+            self.assertEqual(
+                castcut.safe_ref_path(root, "a.png", "day"),
+                os.path.join(os.path.realpath(root), "day", "a.png"),
+            )
+            for name, sub in [
+                ("../secret.png", ""),
+                ("a.png", "../.."),
+                ("a.png", "day/../../etc"),
+                ("..", ""),
+                ("", ""),
+                ("a\x00.png", ""),
+                ("sub\\a.png", ""),
+            ]:
+                with self.assertRaises(ValueError, msg=(name, sub)):
+                    castcut.safe_ref_path(root, name, sub)
+            # A symlink out of the folder is refused too.
+            outside = tempfile.mkdtemp()
+            try:
+                os.symlink(outside, os.path.join(root, "link"))
+                with self.assertRaises(ValueError):
+                    castcut.safe_ref_path(root, "x.png", "link")
+            finally:
+                os.rmdir(outside)
+
+    def test_rotation_matches_comfy_image_rotate(self):
+        # torch.rot90(image, k, dims=[2, 1]) on B×H×W×C: 90 degrees turns clockwise.
+        image = np.arange(6).reshape(2, 3, 1)
+        self.assertEqual(castcut.rotate_like_comfy(image, "none").tolist(), image.tolist())
+        self.assertEqual(
+            castcut.rotate_like_comfy(image, "90 degrees")[..., 0].tolist(), [[3, 0], [4, 1], [5, 2]]
+        )
+        self.assertEqual(
+            castcut.rotate_like_comfy(image, "270 degrees")[..., 0].tolist(), [[2, 5], [1, 4], [0, 3]]
+        )
+        with self.assertRaises(ValueError):
+            castcut.rotation_turns("45 degrees")
+
+    def test_content_input_name_matches_the_app(self):
+        # src/lib/comfy-input-name.ts contentAddressedInputName: "<prefix>-<16 hex><ext>".
+        self.assertEqual(
+            castcut.content_input_name("face-check", ".png", "ABCDEF0123456789ffff"),
+            "face-check-abcdef0123456789.png",
+        )
+        for bad in [("a/b", ".png", "0" * 64), ("a", "png", "0" * 64), ("a", ".png", "xyz")]:
+            with self.assertRaises(ValueError, msg=bad):
+                castcut.content_input_name(*bad)
+
+    def test_cosine_face_distance_is_face_embed_distance(self):
+        self.assertEqual(castcut.cosine_face_distance([1, 0], None), 100.0)
+        self.assertEqual(castcut.cosine_face_distance([1, 2], [1, 2]), 0.0)
+        self.assertAlmostEqual(castcut.cosine_face_distance([1, 0], [0, 1]), 1.0)
+        self.assertAlmostEqual(castcut.cosine_face_distance([1, 0], [1, 1]), 1 - 1 / math.sqrt(2))
+
+    def test_face_boxes_are_largest_first_and_clamped(self):
+        faces = [{"bbox": [10, 10, 20, 20]}, {"bbox": [-5, 50, 105, 130]}]
+        self.assertEqual(
+            castcut.face_boxes(faces, 100, 120),
+            [
+                {"x": 0, "y": 50, "width": 100, "height": 70},
+                {"x": 10, "y": 10, "width": 10, "height": 10},
+            ],
+        )
+
+    def test_fingerprint_changes_with_nodes_or_models_only(self):
+        base = castcut.object_info_fingerprint(["A", "B"], {"loras": ["x.safetensors"]})
+        self.assertEqual(base, castcut.object_info_fingerprint(["B", "A"], {"loras": ["x.safetensors"]}))
+        self.assertNotEqual(base, castcut.object_info_fingerprint(["A"], {"loras": ["x.safetensors"]}))
+        self.assertNotEqual(base, castcut.object_info_fingerprint(["A", "B"], {"loras": ["y.safetensors"]}))
+
+    def test_analyze_request_with_a_fake_analyzer(self):
+        class Fake:
+            def __init__(self):
+                self.calls = []
+
+            def embedding(self, rgb, provider):
+                self.calls.append(provider)
+                return None if rgb.mean() < 10 else np.array([1.0, float(rgb.mean() > 200)])
+
+            def faces(self, rgb, provider):
+                return [{"bbox": [1, 2, 3, 5]}] if rgb.shape[0] > rgb.shape[1] else []
+
+        def png(value, size=(4, 4)):
+            import io  # noqa: PLC0415
+
+            from PIL import Image  # noqa: PLC0415
+
+            buffer = io.BytesIO()
+            Image.new("RGB", size, (value, value, value)).save(buffer, "PNG")
+            return {"data": base64.b64encode(buffer.getvalue()).decode()}
+
+        fake = Fake()
+        result = castcut.analyze_request(
+            {"op": "face-distance", "reference": png(100), "images": [png(100), png(250), png(0)]},
+            fake,
+        )
+        self.assertEqual(result["distances"][0], 0.0)
+        self.assertEqual(result["distances"][2], 100.0)
+        self.assertEqual(fake.calls[0], "CPU")
+        self.assertEqual(
+            castcut.analyze_request({"op": "face-distance", "reference": png(0), "images": []}, fake),
+            {"op": "face-distance", "error": "no-face-in-reference"},
+        )
+        # Wide picture: no face as is, found after a quarter turn; the search stops there.
+        boxes = castcut.analyze_request(
+            {
+                "op": "face-boxes",
+                "image": png(100, (8, 4)),
+                "rotations": ["none", "90 degrees", "270 degrees"],
+            },
+            fake,
+        )
+        self.assertEqual([r["rotation"] for r in boxes["results"]], ["none", "90 degrees"])
+        self.assertEqual(boxes["results"][1]["boxes"], [{"x": 1, "y": 2, "width": 2, "height": 3}])
+        for bad in [{"op": "nope"}, {"op": "face-boxes", "provider": "TPU", "image": png(1)}]:
+            with self.assertRaises(ValueError):
+                castcut.analyze_request(bad, fake)
+
+
+class RouteHelperTests13(unittest.TestCase):
+    """1.3.0: face probe, input delete, health (castcut_nodes.py, "HTTP routes")."""
+
+    def test_probe_faces_follows_face_bounding_box_indexes(self):
+        rgb = np.zeros((100, 200, 3), dtype=np.uint8)
+        big = {"bbox": [100, 10, 140, 50]}
+        small = {"bbox": [10, 10, 30, 30]}
+        seen = []
+
+        def embed(crop):
+            seen.append(crop.shape[:2])
+            return np.array([1.0, 0.0]) if crop.shape[1] > 50 else np.array([0.0, 1.0])
+
+        faces = castcut.probe_faces(rgb, [small, big], embed, np.array([1.0, 0.0]))
+        # Largest first, padded by 30% of the box: 100 - 12 = 88; 10 - 6 = 4.
+        self.assertEqual([f["x"] for f in faces], [88, 4])
+        self.assertEqual(faces[0]["distance"], 0.0)
+        self.assertAlmostEqual(faces[1]["distance"], 1.0)
+        self.assertEqual(seen[0], (62, 64))  # top clamps to 0: 0..62
+        # One face answers both indexes; none is an empty probe.
+        self.assertEqual(len({f["x"] for f in castcut.probe_faces(rgb, [big], embed, [1, 0])}), 1)
+        self.assertEqual(castcut.probe_faces(rgb, [], embed, [1, 0]), [])
+
+    def test_plan_input_delete_keeps_new_queued_and_strange_names(self):
+        import time  # noqa: PLC0415
+
+        with tempfile.TemporaryDirectory() as root:
+            now = time.time()
+            for name, age in [("old-a.png", 10), ("old-b.png", 10), ("queued.png", 10), ("new.png", 0.5)]:
+                path = os.path.join(root, name)
+                with open(path, "wb") as handle:
+                    handle.write(b"x")
+                os.utime(path, (now - age * 86_400, now - age * 86_400))
+            delete, skipped = castcut.plan_input_delete(
+                ["old-a.png", "old-a.png", "queued.png", "new.png", "gone.png", "../x.png", "old-b.png"],
+                root,
+                json.dumps({"1": {"inputs": {"image": "queued.png"}}}),
+                now,
+                0,  # asked for no minimum: the one-day floor still holds
+            )
+            self.assertEqual(sorted(os.path.basename(p) for p in delete), ["old-a.png", "old-b.png"])
+            self.assertEqual(
+                {s["name"]: s["reason"] for s in skipped},
+                {
+                    "queued.png": "in-queue",
+                    "new.png": "too-new",
+                    "gone.png": "missing",
+                    "../x.png": "invalid-name",
+                },
+            )
+
+    def test_health_and_info_without_comfyui(self):
+        health = castcut.health_payload({"running": 0, "pending": 2})
+        self.assertEqual(health["queue"], {"running": 0, "pending": 2})
+        self.assertFalse(health["dwpose"])
+        info = castcut.info_payload()
+        self.assertIn("input-delete", info["routes"])
+        self.assertEqual(info["analyze"]["ops"], list(castcut.ANALYZE_OPS))
+
+    def test_pose_op_without_dwpose_says_so(self):
+        class NoPose:
+            def available(self):
+                return False
+
+        import io  # noqa: PLC0415
+
+        from PIL import Image  # noqa: PLC0415
+
+        buffer = io.BytesIO()
+        Image.new("RGB", (4, 4)).save(buffer, "PNG")
+        image = {"data": base64.b64encode(buffer.getvalue()).decode()}
+        self.assertEqual(
+            castcut.analyze_request({"op": "pose", "image": image}, None, NoPose()),
+            {"op": "pose", "error": "no-dwpose"},
+        )
+
+
+class RouteHelperTests14(unittest.TestCase):
+    """1.4.0: usage counts, png text, person poses' guards."""
+
+    def setUp(self):
+        castcut.USAGE.clear()
+
+    def test_usage_counts_served_errors_and_average(self):
+        castcut.record_usage("analyze:pose", True, 300)
+        castcut.record_usage("analyze:pose", True, 500)
+        castcut.record_usage("analyze:pose", False, 100)
+        castcut.record_usage("stage", True, 4)
+        routes = castcut.usage_payload()["routes"]
+        self.assertEqual(routes["analyze:pose"], {"served": 2, "errors": 1, "avgMs": 300.0})
+        self.assertEqual(list(routes), ["analyze:pose", "stage"])
+
+    def test_png_text_reads_chunks_not_pixels(self):
+        from PIL import Image  # noqa: PLC0415
+        from PIL.PngImagePlugin import PngInfo  # noqa: PLC0415
+
+        with tempfile.TemporaryDirectory() as root:
+            meta = PngInfo()
+            meta.add_text("prompt", json.dumps({"1": {"class_type": "KSampler"}}))
+            meta.add_text("workflow", "{}")
+            path = os.path.join(root, "still.png")
+            Image.new("RGB", (8, 8)).save(path, pnginfo=meta)
+            chunks = castcut.png_text(path)
+            self.assertEqual(json.loads(chunks["prompt"])["1"]["class_type"], "KSampler")
+            self.assertEqual(chunks["workflow"], "{}")
+            bare = os.path.join(root, "bare.png")
+            Image.new("RGB", (8, 8)).save(bare)
+            self.assertEqual(castcut.png_text(bare), {})
+
+    def test_person_poses_needs_its_packs_and_a_plain_model_name(self):
+        class Yes:
+            def available(self):
+                return True
+
+        class No:
+            def available(self):
+                return False
+
+        image = {"filename": "x.png", "type": "output"}
+        self.assertEqual(
+            castcut.analyze_request({"op": "person-poses", "image": image}, None, Yes(), No()),
+            {"op": "person-poses", "error": "no-person-read"},
+        )
+        for bad in ["segm/../../etc/x.pt", "segm/a/b.pt"]:
+            with self.assertRaises(ValueError, msg=bad):
+                castcut.analyze_request(
+                    {"op": "person-poses", "image": image, "model": bad}, None, Yes(), Yes()
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

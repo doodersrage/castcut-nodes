@@ -32,7 +32,7 @@ try:  # numpy ships with ComfyUI; the pose functions below don't need it.
 except ImportError:  # pragma: no cover - only without numpy
     np = None
 
-CASTCUT_VERSION = "1.1.0"
+CASTCUT_VERSION = "1.4.0"
 
 # Every node's object_info `description` ends with this marker, so the app can tell which version
 # is installed without running anything (src/lib/castcut-nodes-setup.ts parses it). Keep the
@@ -1510,3 +1510,781 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "CastcutMaskRepair": "Castcut Mask Repair",
     "CastcutReport": "Castcut Report",
 }
+
+
+# --------------------------------------------------------------------------------------------
+# HTTP routes: checks that do not need the render queue
+# --------------------------------------------------------------------------------------------
+#
+# A face check is a few seconds of work, but queued as a graph it waits for the render in
+# progress (45-95 s on Edit 2511). These routes answer directly, from files already in ComfyUI's
+# folders, so nothing is downloaded and uploaded again. The app asks GET /castcut/info first and
+# falls back to queued graphs when a route is missing.
+#
+#   GET  /castcut/info                -> version, routes, what the analyzer can do
+#   POST /castcut/analyze             -> face-distance / face-boxes (InsightFace buffalo_l)
+#   POST /castcut/stage               -> copy an output into input/ under a content name
+#   GET  /castcut/object-info-fingerprint -> changes when nodes or model files change
+#   POST /castcut/input-delete        -> remove named, old, unqueued files from input/ (1.3.0)
+#   GET  /castcut/health              -> queue, VRAM, loaded models, analyzers, usage (1.3.0)
+#   GET  /castcut/png-text            -> a PNG's text chunks (the saved graph), not its pixels (1.4.0)
+
+ROUTE_PREFIX = "/castcut"
+ROUTES = (
+    "info",
+    "analyze",
+    "stage",
+    "object-info-fingerprint",
+    "input-delete",
+    "health",
+    "png-text",
+)
+ANALYZE_OPS = ("face-distance", "face-boxes", "face-probe", "pose", "person-poses")
+# An input file younger than this is never deleted, whatever the request says.
+INPUT_DELETE_MIN_AGE_SECONDS = 86_400
+VIEW_TYPES = ("input", "output", "temp")
+ROTATIONS = {"none": 0, "90 degrees": 1, "180 degrees": 2, "270 degrees": 3}
+
+
+def safe_ref_path(base_dir, filename, subfolder=""):
+    """`base_dir/subfolder/filename`, or ValueError when it would leave base_dir."""
+    name = str(filename or "").strip()
+    if not name or "\x00" in name or "/" in name or "\\" in name or name in (".", ".."):
+        raise ValueError("Invalid filename.")
+    sub = str(subfolder or "").strip().strip("/")
+    if "\x00" in sub or "\\" in sub:
+        raise ValueError("Invalid subfolder.")
+    root = os.path.realpath(base_dir)
+    path = os.path.realpath(os.path.join(root, sub, name))
+    if os.path.commonpath([root, path]) != root:
+        raise ValueError("Path leaves the folder.")
+    return path
+
+
+def rotation_turns(rotation):
+    """Quarter turns for ComfyUI's ImageRotate names ("none", "90 degrees", …)."""
+    if rotation not in ROTATIONS:
+        raise ValueError(f"Unknown rotation: {rotation}")
+    return ROTATIONS[rotation]
+
+
+def rotate_like_comfy(array, rotation):
+    """ImageRotate's `torch.rot90(image, k, dims=[2, 1])` on one H×W×C image."""
+    turns = rotation_turns(rotation)
+    return array if turns == 0 else np.ascontiguousarray(np.rot90(array, turns, axes=(1, 0)))
+
+
+def content_input_name(prefix, extension, sha256_hex):
+    """The app's contentAddressedInputName: `<prefix>-<16 hex><ext>` (prefix already cleaned)."""
+    digest = str(sha256_hex or "").lower()[:16]
+    if len(digest) != 16 or any(c not in "0123456789abcdef" for c in digest):
+        raise ValueError("Content hash must be hex.")
+    stem = str(prefix or "").strip() or "upload"
+    if "/" in stem or "\\" in stem or "\x00" in stem:
+        raise ValueError("Invalid prefix.")
+    ext = str(extension or ".png").lower()
+    if not ext.startswith(".") or not ext[1:].isalnum() or len(ext) > 6:
+        raise ValueError("Invalid extension.")
+    return f"{stem}-{digest}{ext}"
+
+
+def cosine_face_distance(reference, embedding):
+    """FaceEmbedDistance's cosine distance (ComfyUI_FaceAnalysis); 100.0 = no face."""
+    if embedding is None:
+        return 100.0
+    ref = np.asarray(reference, dtype=np.float64)
+    emb = np.asarray(embedding, dtype=np.float64)
+    if np.array_equal(ref, emb):
+        return 0.0
+    return float(1 - np.dot(ref, emb) / (np.linalg.norm(ref) * np.linalg.norm(emb)))
+
+
+def faces_largest_first(faces):
+    """InsightFace results, largest box first (ComfyUI_FaceAnalysis' get_face order)."""
+    return sorted(
+        faces,
+        key=lambda f: (f["bbox"][2] - f["bbox"][0]) * (f["bbox"][3] - f["bbox"][1]),
+        reverse=True,
+    )
+
+
+def face_boxes(faces, width, height):
+    """FaceBoundingBox's x / y / width / height (padding 0) for each face, largest first."""
+    boxes = []
+    for face in faces_largest_first(faces):
+        x1, y1, x2, y2 = face["bbox"]
+        left, top = int(max(0, x1)), int(max(0, y1))
+        right, bottom = int(min(width, x2)), int(min(height, y2))
+        boxes.append({"x": left, "y": top, "width": right - left, "height": bottom - top})
+    return boxes
+
+
+def object_info_fingerprint(node_names, file_lists):
+    """A short hash of the node list and the model file lists (the input folder left out)."""
+    import hashlib  # noqa: PLC0415
+
+    digest = hashlib.sha256()
+    for name in sorted(node_names):
+        digest.update(name.encode("utf-8", "replace") + b"\n")
+    for folder in sorted(file_lists):
+        digest.update(b"\0" + folder.encode("utf-8", "replace") + b"\n")
+        for item in sorted(file_lists[folder]):
+            digest.update(str(item).encode("utf-8", "replace") + b"\n")
+    return digest.hexdigest()[:32]
+
+
+class FaceAnalyzer:
+    """InsightFace buffalo_l, loaded once per provider, as ComfyUI_FaceAnalysis loads it."""
+
+    def __init__(self):
+        import threading  # noqa: PLC0415
+
+        self._models = {}
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def available():
+        try:
+            import insightface.app  # noqa: F401, PLC0415
+        except Exception:  # noqa: BLE001 - any import failure means "not here"
+            return False
+        return True
+
+    def _model(self, provider):
+        if provider not in self._models:
+            import folder_paths  # noqa: PLC0415 - ComfyUI only
+            from insightface.app import FaceAnalysis  # noqa: PLC0415
+
+            root = os.path.join(folder_paths.models_dir, "insightface")
+            model = FaceAnalysis(
+                name="buffalo_l", root=root, providers=[f"{provider}ExecutionProvider"]
+            )
+            model.prepare(ctx_id=0, det_size=(640, 640))
+            self._models[provider] = model
+        return self._models[provider]
+
+    def faces(self, rgb, provider="CPU"):
+        """get_face: detector sizes 640 down to 320 until a face shows; [] when none."""
+        with self._lock:
+            model = self._model(provider)
+            for size in range(640, 256, -64):
+                model.det_model.input_size = (size, size)
+                found = model.get(rgb)
+                if len(found) > 0:
+                    return faces_largest_first(found)
+        return []
+
+    def embedding(self, rgb, provider="CPU"):
+        found = self.faces(rgb, provider)
+        return found[0].normed_embedding if found else None
+
+
+_ANALYZER = None
+
+
+def _analyzer():
+    global _ANALYZER  # noqa: PLW0603 - one loaded model per ComfyUI process
+    if _ANALYZER is None:
+        _ANALYZER = FaceAnalyzer()
+    return _ANALYZER
+
+
+def _ref_path(ref):
+    import folder_paths  # noqa: PLC0415 - ComfyUI only
+
+    kind = str((ref or {}).get("type") or "output")
+    if kind not in VIEW_TYPES:
+        raise ValueError("Invalid type.")
+    return safe_ref_path(
+        folder_paths.get_directory_by_type(kind), ref.get("filename"), ref.get("subfolder") or ""
+    )
+
+
+def _load_rgb(ref):
+    """LoadImage's pixels (EXIF turned, RGB) from a ref or base64 `data`, as uint8 H×W×3."""
+    import base64  # noqa: PLC0415
+    import io  # noqa: PLC0415
+
+    from PIL import Image, ImageOps  # noqa: PLC0415
+
+    if isinstance(ref, dict) and ref.get("data"):
+        image = Image.open(io.BytesIO(base64.b64decode(ref["data"])))
+    else:
+        image = Image.open(_ref_path(ref))
+    image = ImageOps.exif_transpose(image).convert("RGB")
+    return np.array(image)
+
+
+def analyze_request(body, analyzer, pose_analyzer=None, person_reader=None):
+    """The work behind POST /castcut/analyze (no aiohttp, for tests)."""
+    op = body.get("op")
+    provider = body.get("provider") or "CPU"
+    if provider not in ("CPU", "CUDA"):
+        raise ValueError("provider must be CPU or CUDA.")
+    if op == "face-distance":
+        reference = analyzer.embedding(_load_rgb(body.get("reference")), provider)
+        if reference is None:
+            return {"op": op, "error": "no-face-in-reference"}
+        distances = [
+            cosine_face_distance(reference, analyzer.embedding(_load_rgb(ref), provider))
+            for ref in body.get("images") or []
+        ]
+        return {"op": op, "metric": "cosine", "distances": distances}
+    if op == "face-boxes":
+        rgb = _load_rgb(body.get("image"))
+        results = []
+        for rotation in body.get("rotations") or ["none"]:
+            turned = rotate_like_comfy(rgb, rotation)
+            height, width = turned.shape[:2]
+            boxes = face_boxes(analyzer.faces(turned, provider), width, height)
+            results.append({"rotation": rotation, "boxes": boxes})
+            if boxes and body.get("stopAtFirst", True):
+                break
+        return {"op": op, "results": results}
+    if op == "face-probe":
+        reference = analyzer.embedding(_load_rgb(body.get("reference")), provider)
+        if reference is None:
+            return {"op": op, "error": "no-face-in-reference"}
+        rgb = _load_rgb(body.get("image"))
+        faces = probe_faces(
+            rgb,
+            analyzer.faces(rgb, provider),
+            lambda crop: analyzer.embedding(crop, provider),
+            reference,
+            padding_percent=float(body.get("paddingPercent", 0.3)),
+            count=int(body.get("count", 2)),
+        )
+        return {"op": op, "metric": "cosine", "faces": faces}
+    if op == "pose":
+        if pose_analyzer is None or not pose_analyzer.available():
+            return {"op": op, "error": "no-dwpose"}
+        text = pose_analyzer.openpose_json(
+            _load_rgb(body.get("image")),
+            hands=body.get("hands", True) is not False,
+            body=body.get("body", True) is not False,
+            face=body.get("face", False) is True,
+        )
+        return {"op": op, "openpose_json": text}
+    if op == "person-poses":
+        if (
+            pose_analyzer is None
+            or not pose_analyzer.available()
+            or person_reader is None
+            or not person_reader.available()
+        ):
+            return {"op": op, "error": "no-person-read"}
+        model_name = str(body.get("model") or "segm/person_yolov8m-seg.pt")
+        if "/" in model_name.strip("/").split("/", 1)[-1] or ".." in model_name:
+            raise ValueError("Invalid model name.")
+        texts = person_reader.poses(
+            _load_rgb(body.get("image")),
+            pose_analyzer,
+            model_name,
+            count=max(1, min(4, int(body.get("count", 2)))),
+        )
+        return {"op": op, "openpose_json": texts}
+    raise ValueError(f"Unknown op: {op}")
+
+
+def stage_request(body):
+    """The work behind POST /castcut/stage: copy a ComfyUI file into input/ under its content name."""
+    import hashlib  # noqa: PLC0415
+    import shutil  # noqa: PLC0415
+
+    import folder_paths  # noqa: PLC0415 - ComfyUI only
+
+    source = _ref_path(body)
+    with open(source, "rb") as handle:
+        digest = hashlib.sha256(handle.read()).hexdigest()
+    name = content_input_name(body.get("prefix"), body.get("extension"), digest)
+    input_dir = folder_paths.get_input_directory()
+    target = safe_ref_path(input_dir, name)
+    reused = os.path.exists(target) and os.path.getsize(target) == os.path.getsize(source)
+    if not reused:
+        temp = f"{target}.part"
+        shutil.copyfile(source, temp)
+        os.replace(temp, target)
+    return {"name": name, "subfolder": "", "type": "input", "reused": reused}
+
+
+def fingerprint_request():
+    import folder_paths  # noqa: PLC0415 - ComfyUI only
+    import nodes  # noqa: PLC0415 - ComfyUI only
+
+    lists = {}
+    for folder in folder_paths.folder_names_and_paths:
+        if folder in ("custom_nodes", "configs"):
+            continue
+        try:
+            lists[folder] = folder_paths.get_filename_list(folder)
+        except Exception:  # noqa: BLE001 - a folder type this ComfyUI can't list
+            continue
+    return {"fingerprint": object_info_fingerprint(nodes.NODE_CLASS_MAPPINGS.keys(), lists)}
+
+
+def probe_faces(rgb, faces, embed, reference, padding_percent=0.3, count=2):
+    """
+    The Face finish probe graph (face-finish.ts buildLeadFaceProbeGraph): FaceBoundingBox with
+    `padding_percent` at index 0..count-1, each crop compared with the reference by
+    FaceEmbedDistance. As FaceBoundingBox does, one face answers every index and an index past the
+    last face answers the last. `x` is the padded box's left edge. [] when there is no face.
+    """
+    from PIL import Image  # noqa: PLC0415
+
+    ordered = faces_largest_first(faces)
+    if not ordered:
+        return []
+    image = Image.fromarray(rgb)
+    out = []
+    for index in range(count):
+        face = ordered[0 if len(ordered) == 1 else min(index, len(ordered) - 1)]
+        x1, y1, x2, y2 = face["bbox"]
+        width, height = x2 - x1, y2 - y1
+        left = int(max(0, x1 - int(width * padding_percent)))
+        top = int(max(0, y1 - int(height * padding_percent)))
+        right = int(min(image.width, x2 + int(width * padding_percent)))
+        bottom = int(min(image.height, y2 + int(height * padding_percent)))
+        crop = np.array(image.crop((left, top, right, bottom)))
+        out.append({"x": left, "distance": cosine_face_distance(reference, embed(crop))})
+    return out
+
+
+class PoseAnalyzer:
+    """
+    comfyui_controlnet_aux's DWPose, built once with CPU onnxruntime sessions so a pose read does
+    not take GPU memory from a render in progress. Same models and defaults as the app's
+    pose-check graph (DWPreprocessor with its Python defaults: yolox_l.onnx,
+    dw-ll_ucoco_384.onnx, resolution 512).
+    """
+
+    def __init__(self):
+        import threading  # noqa: PLC0415
+
+        self._model = None
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _wrapper():
+        import sys  # noqa: PLC0415
+
+        try:
+            import nodes  # noqa: PLC0415 - ComfyUI only
+        except Exception:  # noqa: BLE001
+            return None
+        node = nodes.NODE_CLASS_MAPPINGS.get("DWPreprocessor")
+        module = sys.modules.get(getattr(node, "__module__", "")) if node else None
+        needed = ("DwposeDetector", "common_annotator_call", "DWPOSE_MODEL_NAME")
+        return module if module and all(hasattr(module, name) for name in needed) else None
+
+    def available(self):
+        return self._wrapper() is not None
+
+    def _detector(self, wrapper):
+        if self._model is None:
+            import sys  # noqa: PLC0415
+
+            import torch  # noqa: PLC0415
+
+            detector = wrapper.DwposeDetector
+            wholebody = sys.modules.get(f"{detector.__module__}.wholebody")
+            original = getattr(wholebody, "get_ort_providers", None)
+            if wholebody is not None and original is not None:
+                # Only while this copy's sessions are made; the queue's DWPose is untouched.
+                wholebody.get_ort_providers = lambda: ["CPUExecutionProvider"]
+            try:
+                self._model = detector.from_pretrained(
+                    wrapper.DWPOSE_MODEL_NAME,
+                    wrapper.DWPOSE_MODEL_NAME,
+                    det_filename="yolox_l.onnx",
+                    pose_filename="dw-ll_ucoco_384.onnx",
+                    torchscript_device=torch.device("cpu"),
+                )
+            finally:
+                if wholebody is not None and original is not None:
+                    wholebody.get_ort_providers = original
+        return self._model
+
+    def openpose_json(self, rgb, hands=True, body=True, face=False, resolution=512):
+        import torch  # noqa: PLC0415
+
+        # LoadImage's float pixels.
+        tensor = torch.from_numpy(rgb.astype(np.float32) / 255.0)[None]
+        return self.openpose_json_tensor(tensor, hands, body, face, resolution)
+
+    def openpose_json_tensor(self, tensor, hands=True, body=True, face=False, resolution=512):
+        """The DWPreprocessor node's `openpose_json` for an IMAGE tensor (B×H×W×C floats)."""
+        wrapper = self._wrapper()
+        if wrapper is None:
+            raise RuntimeError("DWPose (comfyui_controlnet_aux) is not installed.")
+        with self._lock:
+            model = self._detector(wrapper)
+            # The node's own call (no progress bar sent).
+            dicts = []
+
+            def run(image, **kwargs):
+                pose_image, openpose = model(image, **kwargs)
+                dicts.append(openpose)
+                return pose_image
+
+            wrapper.common_annotator_call(
+                run,
+                tensor,
+                show_pbar=False,
+                include_hand=hands,
+                include_face=face,
+                include_body=body,
+                image_and_json=True,
+                resolution=resolution,
+                xinsr_stick_scaling=False,
+            )
+        return json.dumps(dicts, indent=4)
+
+
+class PersonReader:
+    """
+    The app's two-person pose read (pose-person-reads.ts buildPersonReadGraph) in-process: the
+    Impact Pack's person segmentation (YOLO pinned to the CPU), each of the largest people alone
+    on grey, DWPose (PoseAnalyzer, CPU) on each. The graph's own node functions, so its masks;
+    only the device differs.
+    """
+
+    def __init__(self):
+        import threading  # noqa: PLC0415
+
+        self._detectors = {}
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def available():
+        try:
+            import nodes  # noqa: PLC0415 - ComfyUI only
+        except Exception:  # noqa: BLE001
+            return False
+        needed = (
+            "UltralyticsDetectorProvider",
+            "SegmDetectorSEGS",
+            "ImpactSEGSOrderedFilter",
+            "SegsToCombinedMask",
+        )
+        return all(name in nodes.NODE_CLASS_MAPPINGS for name in needed)
+
+    def _segm_detector(self, model_name):
+        if model_name not in self._detectors:
+            import nodes  # noqa: PLC0415 - ComfyUI only
+
+            provider = nodes.NODE_CLASS_MAPPINGS["UltralyticsDetectorProvider"]()
+            _, segm = provider.doit(model_name)
+            real = getattr(segm, "bbox_model", None)
+            if real is None:
+                raise RuntimeError(f"{model_name} is not a segmentation model.")
+
+            class CpuYolo:
+                """The YOLO model, always asked to run on the CPU."""
+
+                def __call__(self, *args, **kwargs):
+                    kwargs["device"] = "cpu"
+                    return real(*args, **kwargs)
+
+                def __getattr__(self, name):
+                    return getattr(real, name)
+
+            segm.bbox_model = CpuYolo()
+            self._detectors[model_name] = segm
+        return self._detectors[model_name]
+
+    def poses(self, rgb, pose_analyzer, model_name, count=2, threshold=0.35, dilation=6,
+              crop_factor=1, drop_size=40, grey=0x808080):
+        import torch  # noqa: PLC0415
+
+        import node_helpers  # noqa: PLC0415 - ComfyUI only
+        import nodes  # noqa: PLC0415 - ComfyUI only
+        from comfy_extras.nodes_mask import composite  # noqa: PLC0415 - ComfyUI only
+
+        mappings = nodes.NODE_CLASS_MAPPINGS
+        image = torch.from_numpy(rgb.astype(np.float32) / 255.0)[None]
+        with self._lock:
+            segm = self._segm_detector(model_name)
+            segs = mappings["SegmDetectorSEGS"]().doit(
+                segm, image, threshold, dilation, crop_factor, drop_size, "all"
+            )[0]
+            height, width = image.shape[1], image.shape[2]
+            backdrop = nodes.EmptyImage().generate(width, height, 1, grey)[0]
+            alone_images = []
+            for index in range(count):
+                taken = mappings["ImpactSEGSOrderedFilter"]().doit(segs, "area(=w*h)", True, index, 1)[0]
+                mask = mappings["SegsToCombinedMask"]().doit(taken)[0]
+                # ImageCompositeMasked.execute, x = y = 0, no resize.
+                destination, source = node_helpers.image_alpha_fix(backdrop, image)
+                destination = destination.clone().movedim(-1, 1)
+                alone = composite(destination, source.movedim(-1, 1), 0, 0, mask, 1, False).movedim(1, -1)
+                alone_images.append(alone)
+        return [pose_analyzer.openpose_json_tensor(alone) for alone in alone_images]
+
+
+_PERSON_READER = None
+
+
+def _person_reader():
+    global _PERSON_READER  # noqa: PLW0603 - one detector per ComfyUI process
+    if _PERSON_READER is None:
+        _PERSON_READER = PersonReader()
+    return _PERSON_READER
+
+
+# What the routes answered since ComfyUI started, for /castcut/health: {key: {served, errors, ms}}.
+USAGE = {}
+_STARTED = None
+
+
+def record_usage(key, ok, elapsed_ms):
+    """Count one route call (an analyze op, or a route name)."""
+    entry = USAGE.setdefault(key, {"served": 0, "errors": 0, "ms": 0.0})
+    if ok:
+        entry["served"] += 1
+    else:
+        entry["errors"] += 1
+    entry["ms"] += float(elapsed_ms)
+
+
+def usage_payload():
+    return {
+        "since": _STARTED,
+        "routes": {
+            key: {
+                "served": value["served"],
+                "errors": value["errors"],
+                "avgMs": round(value["ms"] / max(1, value["served"] + value["errors"]), 1),
+            }
+            for key, value in sorted(USAGE.items())
+        },
+    }
+
+
+def png_text(path):
+    """A PNG's text chunks (ComfyUI's `prompt` / `workflow`) without decoding its pixels."""
+    from PIL import Image  # noqa: PLC0415
+
+    with Image.open(path) as image:
+        info = dict(getattr(image, "text", None) or image.info)
+    return {key: value for key, value in info.items() if isinstance(value, str)}
+
+
+def png_text_request(query):
+    chunks = png_text(_ref_path(query))
+    wanted = [name for name in (query.get("keys") or "prompt").split(",") if name]
+    return {name: chunks.get(name) for name in wanted}
+
+
+def plan_input_delete(names, input_dir, queue_text, now, min_age_seconds):
+    """
+    Which of `names` may go: plain names in the input folder's top level, at least
+    `min_age_seconds` old (never under a day), not named by a running or pending job.
+    Returns (paths to delete, skipped [{name, reason}]).
+    """
+    min_age = max(INPUT_DELETE_MIN_AGE_SECONDS, int(min_age_seconds or 0))
+    delete, skipped, seen = [], [], set()
+    for raw in names:
+        name = str(raw or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        try:
+            path = safe_ref_path(input_dir, name)
+        except ValueError:
+            skipped.append({"name": name, "reason": "invalid-name"})
+            continue
+        if name in queue_text:
+            skipped.append({"name": name, "reason": "in-queue"})
+            continue
+        if not os.path.isfile(path):
+            skipped.append({"name": name, "reason": "missing"})
+            continue
+        if now - os.path.getmtime(path) < min_age:
+            skipped.append({"name": name, "reason": "too-new"})
+            continue
+        delete.append(path)
+    return delete, skipped
+
+
+def input_delete_request(body, queue_text):
+    import time  # noqa: PLC0415
+
+    import folder_paths  # noqa: PLC0415 - ComfyUI only
+
+    names = body.get("names")
+    if not isinstance(names, list) or len(names) > 50_000:
+        raise ValueError("names must be a list (at most 50,000).")
+    paths, skipped = plan_input_delete(
+        names,
+        folder_paths.get_input_directory(),
+        queue_text,
+        time.time(),
+        body.get("minAgeSeconds"),
+    )
+    deleted, freed = [], 0
+    for path in paths:
+        try:
+            size = os.path.getsize(path)
+            os.remove(path)
+        except OSError as error:
+            skipped.append({"name": os.path.basename(path), "reason": f"error: {error.strerror}"})
+            continue
+        deleted.append(os.path.basename(path))
+        freed += size
+    return {"deleted": deleted, "freedBytes": freed, "skipped": skipped}
+
+
+def health_payload(queue_counts):
+    payload = {
+        "version": CASTCUT_VERSION,
+        "queue": queue_counts,
+        "faceAnalysis": FaceAnalyzer.available(),
+        "dwpose": PoseAnalyzer().available(),
+        "personRead": PersonReader.available(),
+        "usage": usage_payload(),
+        "analyzersLoaded": {
+            "face": bool(_ANALYZER and _ANALYZER._models),
+            "pose": bool(_POSE_ANALYZER and _POSE_ANALYZER._model is not None),
+        },
+    }
+    try:
+        import torch  # noqa: PLC0415
+
+        if torch.cuda.is_available():
+            free, total = torch.cuda.mem_get_info()
+            payload["vram"] = {"freeBytes": int(free), "totalBytes": int(total)}
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import comfy.model_management as mm  # noqa: PLC0415 - ComfyUI only
+
+        payload["loadedModels"] = [
+            type(getattr(getattr(loaded, "model", None), "model", None)).__name__
+            for loaded in list(getattr(mm, "current_loaded_models", []))
+        ]
+    except Exception:  # noqa: BLE001
+        pass
+    return payload
+
+
+_POSE_ANALYZER = None
+
+
+def _pose_analyzer():
+    global _POSE_ANALYZER  # noqa: PLW0603 - one DWPose copy per ComfyUI process
+    if _POSE_ANALYZER is None:
+        _POSE_ANALYZER = PoseAnalyzer()
+    return _POSE_ANALYZER
+
+
+def info_payload():
+    return {
+        "name": "castcut-nodes",
+        "version": CASTCUT_VERSION,
+        "routes": list(ROUTES),
+        "analyze": {
+            "faceAnalysis": FaceAnalyzer.available(),
+            "dwpose": PoseAnalyzer().available(),
+            "personRead": PersonReader.available(),
+            "ops": list(ANALYZE_OPS),
+        },
+    }
+
+
+def register_routes():
+    """Add the routes to ComfyUI's server; False outside ComfyUI (tests, a plain import)."""
+    try:
+        from aiohttp import web  # noqa: PLC0415
+        from server import PromptServer  # noqa: PLC0415 - ComfyUI only
+
+        routes = PromptServer.instance.routes
+    except Exception:  # noqa: BLE001 - not running inside ComfyUI
+        return False
+
+    async def run(work, *args, usage_key=None):
+        import asyncio  # noqa: PLC0415
+        import time  # noqa: PLC0415
+
+        loop = asyncio.get_running_loop()
+        started = time.perf_counter()
+        ok = False
+        try:
+            result = await loop.run_in_executor(None, work, *args)
+            ok = not (isinstance(result, dict) and result.get("error"))
+            return web.json_response(result)
+        except (ValueError, FileNotFoundError) as error:
+            return web.json_response({"error": str(error)}, status=400)
+        except Exception as error:  # noqa: BLE001 - report, don't crash the server
+            return web.json_response({"error": f"{type(error).__name__}: {error}"}, status=500)
+        finally:
+            if usage_key:
+                record_usage(usage_key, ok, (time.perf_counter() - started) * 1000)
+
+    async def read_json(request):
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            return None
+        return body if isinstance(body, dict) else None
+
+    @routes.get(f"{ROUTE_PREFIX}/info")
+    async def castcut_info(_request):
+        return web.json_response(info_payload())
+
+    @routes.post(f"{ROUTE_PREFIX}/analyze")
+    async def castcut_analyze(request):
+        body = await read_json(request)
+        if body is None:
+            return web.json_response({"error": "JSON body required."}, status=400)
+        op = str(body.get("op") or "")
+        return await run(
+            analyze_request,
+            body,
+            _analyzer(),
+            _pose_analyzer(),
+            _person_reader(),
+            usage_key=f"analyze:{op}" if op in ANALYZE_OPS else "analyze:unknown",
+        )
+
+    @routes.post(f"{ROUTE_PREFIX}/stage")
+    async def castcut_stage(request):
+        body = await read_json(request)
+        if body is None:
+            return web.json_response({"error": "JSON body required."}, status=400)
+        return await run(stage_request, body, usage_key="stage")
+
+    @routes.get(f"{ROUTE_PREFIX}/object-info-fingerprint")
+    async def castcut_fingerprint(_request):
+        return await run(fingerprint_request)
+
+    def queue_state():
+        running, pending = PromptServer.instance.prompt_queue.get_current_queue()
+        return running, pending
+
+    @routes.post(f"{ROUTE_PREFIX}/input-delete")
+    async def castcut_input_delete(request):
+        body = await read_json(request)
+        if body is None:
+            return web.json_response({"error": "JSON body required."}, status=400)
+        running, pending = queue_state()
+        # Names in a running or pending job's graph are never deleted.
+        queue_text = json.dumps([item[2] for item in running + pending if len(item) > 2])
+        return await run(input_delete_request, body, queue_text, usage_key="input-delete")
+
+    @routes.get(f"{ROUTE_PREFIX}/png-text")
+    async def castcut_png_text(request):
+        return await run(png_text_request, dict(request.query), usage_key="png-text")
+
+    @routes.get(f"{ROUTE_PREFIX}/health")
+    async def castcut_health(_request):
+        running, pending = queue_state()
+        return await run(health_payload, {"running": len(running), "pending": len(pending)})
+
+    global _STARTED  # noqa: PLW0603
+    import time  # noqa: PLC0415
+
+    _STARTED = int(time.time() * 1000)
+    return True
+
+
+ROUTES_REGISTERED = register_routes()

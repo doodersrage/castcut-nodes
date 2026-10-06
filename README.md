@@ -26,6 +26,30 @@ always did.
 | `CastcutMaskRepair` | image, mask, fill `#rrggbb`, regrow edges, optional LoadImage mask | composite, repaired mask, report JSON |
 | `CastcutReport` | report JSON, optional alternate image | UI output `castcut` (read from `/history`), alternate saved to output |
 
+## Routes (1.2.0, more in 1.3.0 and 1.4.0)
+
+The pack also adds HTTP routes to ComfyUI's server (`castcut_nodes.py`, "HTTP routes"). The app
+asks `GET /castcut/info` and falls back to queued graphs when a route is missing or fails.
+
+| Route | Does |
+| --- | --- |
+| `GET /castcut/info` | version, routes, whether InsightFace is importable |
+| `POST /castcut/analyze` | `face-distance` (reference + images → cosine distances, 100 = no face) and `face-boxes` (image + ImageRotate turns → boxes, stops at the first turn with a face); images are `{filename, subfolder, type}` read in place, or `{data: <base64>}`; `provider` `CPU` (default) or `CUDA` |
+| `POST /castcut/stage` | copy an output/temp file into `input/` as `<prefix>-<sha256[:16]><ext>`, the app's upload name for the same bytes |
+| `GET /castcut/object-info-fingerprint` | a hash of the node list and the model file lists (not the input folder) |
+| `POST /castcut/analyze` `face-probe` (1.3.0) | the Face finish probe: the `count` largest faces, each cropped with `paddingPercent` (FaceBoundingBox) and compared with a reference → `[{x, distance}]` |
+| `POST /castcut/analyze` `pose` (1.3.0) | DWPose `openpose_json` (body + hands, no face; yolox_l.onnx, dw-ll_ucoco_384.onnx, 512) from comfyui_controlnet_aux, built once with **CPU** onnxruntime sessions |
+| `POST /castcut/input-delete` (1.3.0) | delete the named files from `input/`: plain top-level names only, at least `minAgeSeconds` old (never under a day), not named by a running or pending job → deleted / skipped with reasons |
+| `GET /castcut/health` (1.3.0) | queue counts, free VRAM, loaded model classes, which analyzers are installed and loaded; from 1.4.0 `usage` — per route / op, how many calls were served or failed and their average time since ComfyUI started |
+| `POST /castcut/analyze` `person-poses` (1.4.0) | the app's two-person pose read: the Impact Pack's person segmentation (`SegmDetectorSEGS` with the YOLO model pinned to the CPU), each of the `count` largest people alone on grey (`ImpactSEGSOrderedFilter`, `SegsToCombinedMask`, ComfyUI's composite), DWPose on each → one `openpose_json` per person |
+| `GET /castcut/png-text` (1.4.0) | `?filename&subfolder&type&keys=prompt` — a PNG's text chunks (the graph it was made with) without sending the picture |
+
+The analyzer is InsightFace buffalo_l loaded once per provider, with ComfyUI_FaceAnalysis'
+detection (sizes 640 → 320 until a face shows, largest first) and FaceEmbedDistance's cosine.
+Paths are resolved inside ComfyUI's input / output / temp folders only. The pose copy is DWPose's
+own detector and annotator call (progress bar off), so its keypoints are the node's; it runs on
+the CPU so it never takes GPU memory from a render (~0.3 s a still).
+
 `CastcutPoseScore` and `CastcutMaskRepair` are ports of `src/lib/pose-score.ts`,
 `pose-limb-score.ts`, `pose-posture.ts` and `src/lib/isolate-mask.ts`. They stay in step through
 shared test vectors (`tests/vectors/*.json`) that both test suites read.
@@ -71,7 +95,7 @@ setup. See [docs/castcut-nodes.md](https://github.com/doodersrage/castcut/blob/m
    ```
 
 Check `http://127.0.0.1:8188/object_info/CastcutPoseScore` returns the node; its `description`
-ends with `[castcut-nodes 1.1.0]`, which is how the app reads the installed version. To update,
+ends with `[castcut-nodes 1.4.0]`, which is how the app reads the installed version. To update,
 copy / pull / update again and restart. Install it one way only — a `castcut_nodes.py` file and a
 `castcut` folder side by side both load.
 
