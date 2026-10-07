@@ -4,7 +4,7 @@
 [project]
 name = "castcut-nodes"
 description = "Castcut's checks inside ComfyUI: in-job pose score and best-of-two pick, matte repair, and HTTP routes that answer face, pose and two-person pose checks on the CPU without waiting for the render queue, plus input-folder clean-up and health for the Castcut app."
-version = "1.4.0"
+version = "1.5.0"
 license = { file = "LICENSE" }
 readme = "README.md"
 requires-python = ">=3.9"

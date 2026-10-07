@@ -32,7 +32,7 @@ try:  # numpy ships with ComfyUI; the pose functions below don't need it.
 except ImportError:  # pragma: no cover - only without numpy
     np = None
 
-CASTCUT_VERSION = "1.4.0"
+CASTCUT_VERSION = "1.5.0"
 
 # Every node's object_info `description` ends with this marker, so the app can tell which version
 # is installed without running anything (src/lib/castcut-nodes-setup.ts parses it). Keep the
@@ -1538,6 +1538,7 @@ ROUTES = (
     "input-delete",
     "health",
     "png-text",
+    "editor-workflow",
 )
 ANALYZE_OPS = ("face-distance", "face-boxes", "face-probe", "pose", "person-poses")
 # An input file younger than this is never deleted, whatever the request says.
@@ -2177,6 +2178,66 @@ def _pose_analyzer():
     return _POSE_ANALYZER
 
 
+# "Open in ComfyUI": ComfyUI serves a pack folder's example_workflows/ as templates
+# (/api/workflow_templates/<pack folder>/<name>.json, registered at startup), and its editor
+# opens one straight onto the canvas from `?template=<name>&source=<pack folder>`. The app writes
+# the still's graph here so the link opens it — no digging in the Workflows sidebar.
+PACK_DIR = os.path.dirname(os.path.abspath(__file__))
+EDITOR_WORKFLOWS_DIR = os.path.join(PACK_DIR, "example_workflows")
+EDITOR_WORKFLOW_PREFIX = "castcut-"
+EDITOR_WORKFLOW_KEEP = 20
+# The folder must exist when ComfyUI starts for its templates route to be registered.
+EDITOR_WORKFLOWS_AT_START = os.path.isdir(EDITOR_WORKFLOWS_DIR)
+_TEMPLATE_NAME_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-")
+
+
+def _template_name_ok(name):
+    return 0 < len(name) <= 120 and set(name) <= _TEMPLATE_NAME_CHARS
+
+
+def editor_template_source():
+    """The `source` ComfyUI serves this pack's example_workflows under, or None.
+
+    A single-file install (castcut_nodes.py loose in custom_nodes/) has no folder of its own —
+    ComfyUI names its templates by the file's full path, which the editor cannot load.
+    """
+    if not os.path.isfile(os.path.join(PACK_DIR, "__init__.py")):
+        return None
+    name = os.path.basename(PACK_DIR)
+    return name if _template_name_ok(name) else None
+
+
+def editor_workflow_request(body):
+    source = editor_template_source()
+    if source is None:
+        return {"source": None, "reason": "single-file"}
+    if not EDITOR_WORKFLOWS_AT_START:
+        return {"source": None, "reason": "restart"}
+    name = str(body.get("name") or "")
+    workflow = body.get("workflow")
+    if not _template_name_ok(name):
+        raise ValueError("name: letters, digits, '.', '_' and '-' only.")
+    if not isinstance(workflow, dict) or not isinstance(workflow.get("nodes"), list):
+        raise ValueError("workflow must be a ComfyUI editor workflow.")
+    template = name if name.startswith(EDITOR_WORKFLOW_PREFIX) else EDITOR_WORKFLOW_PREFIX + name
+    path = os.path.join(EDITOR_WORKFLOWS_DIR, template + ".json")
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(workflow, handle)
+    # Keep the newest few: the folder also lists in ComfyUI's template browser.
+    ours = sorted(
+        (entry for entry in os.listdir(EDITOR_WORKFLOWS_DIR)
+         if entry.startswith(EDITOR_WORKFLOW_PREFIX) and entry.endswith(".json")),
+        key=lambda entry: os.path.getmtime(os.path.join(EDITOR_WORKFLOWS_DIR, entry)),
+        reverse=True,
+    )
+    for stale in ours[EDITOR_WORKFLOW_KEEP:]:
+        try:
+            os.remove(os.path.join(EDITOR_WORKFLOWS_DIR, stale))
+        except OSError:
+            pass
+    return {"source": source, "template": template}
+
+
 def info_payload():
     return {
         "name": "castcut-nodes",
@@ -2274,6 +2335,13 @@ def register_routes():
     @routes.get(f"{ROUTE_PREFIX}/png-text")
     async def castcut_png_text(request):
         return await run(png_text_request, dict(request.query), usage_key="png-text")
+
+    @routes.post(f"{ROUTE_PREFIX}/editor-workflow")
+    async def castcut_editor_workflow(request):
+        body = await read_json(request)
+        if body is None:
+            return web.json_response({"error": "JSON body required."}, status=400)
+        return await run(editor_workflow_request, body, usage_key="editor-workflow")
 
     @routes.get(f"{ROUTE_PREFIX}/health")
     async def castcut_health(_request):

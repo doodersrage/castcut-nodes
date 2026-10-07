@@ -557,5 +557,45 @@ class RouteHelperTests14(unittest.TestCase):
                 )
 
 
+
+class EditorWorkflowTests(unittest.TestCase):
+    """1.5.0: "Open in ComfyUI" writes the still's graph where the editor can open it by URL."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.saved = (castcut.PACK_DIR, castcut.EDITOR_WORKFLOWS_DIR, castcut.EDITOR_WORKFLOWS_AT_START)
+        pack = os.path.join(self.tmp, "castcut-nodes")
+        os.makedirs(os.path.join(pack, "example_workflows"))
+        castcut.PACK_DIR = pack
+        castcut.EDITOR_WORKFLOWS_DIR = os.path.join(pack, "example_workflows")
+        castcut.EDITOR_WORKFLOWS_AT_START = True
+
+    def tearDown(self):
+        castcut.PACK_DIR, castcut.EDITOR_WORKFLOWS_DIR, castcut.EDITOR_WORKFLOWS_AT_START = self.saved
+
+    def test_single_file_install_has_no_source(self):
+        self.assertEqual(castcut.editor_workflow_request({"name": "x", "workflow": {"nodes": []}}),
+                         {"source": None, "reason": "single-file"})
+
+    def test_writes_template_and_keeps_newest(self):
+        open(os.path.join(castcut.PACK_DIR, "__init__.py"), "w").close()
+        result = castcut.editor_workflow_request({"name": "day-2026-10-07-ab12", "workflow": {"nodes": [1]}})
+        self.assertEqual(result, {"source": "castcut-nodes", "template": "castcut-day-2026-10-07-ab12"})
+        with open(os.path.join(castcut.EDITOR_WORKFLOWS_DIR, "castcut-day-2026-10-07-ab12.json")) as handle:
+            self.assertEqual(json.load(handle), {"nodes": [1]})
+        for index in range(castcut.EDITOR_WORKFLOW_KEEP + 3):
+            castcut.editor_workflow_request({"name": f"n{index}", "workflow": {"nodes": []}})
+        names = [n for n in os.listdir(castcut.EDITOR_WORKFLOWS_DIR) if n.startswith("castcut-")]
+        self.assertEqual(len(names), castcut.EDITOR_WORKFLOW_KEEP)
+
+    def test_rejects_bad_names_and_needs_a_restart_for_a_new_folder(self):
+        open(os.path.join(castcut.PACK_DIR, "__init__.py"), "w").close()
+        for bad in ["../x", "a b", ""]:
+            with self.assertRaises(ValueError, msg=bad):
+                castcut.editor_workflow_request({"name": bad, "workflow": {"nodes": []}})
+        castcut.EDITOR_WORKFLOWS_AT_START = False
+        self.assertEqual(castcut.editor_workflow_request({"name": "x", "workflow": {"nodes": []}})["reason"], "restart")
+
+
 if __name__ == "__main__":
     unittest.main()
