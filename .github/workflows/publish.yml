@@ -57,4 +57,9 @@ jobs:
       - name: Publish to the Comfy Registry
         env:
           REGISTRY_ACCESS_TOKEN: ${{ secrets.REGISTRY_ACCESS_TOKEN }}
-        run: comfy --skip-prompt node publish --token "$REGISTRY_ACCESS_TOKEN"
+        run: |
+          if [ -z "$REGISTRY_ACCESS_TOKEN" ]; then
+            echo "::error::Repository secret REGISTRY_ACCESS_TOKEN is not set. Add it (Settings → Secrets and variables → Actions, or: gh secret set REGISTRY_ACCESS_TOKEN -R doodersrage/castcut-nodes) with a publisher API key from https://registry.comfy.org, then re-run."
+            exit 1
+          fi
+          comfy --skip-prompt node publish --token "$REGISTRY_ACCESS_TOKEN"
