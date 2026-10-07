@@ -47,6 +47,14 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     steps:
-      - uses: Comfy-Org/publish-node-action@1.0.1
+      # Comfy-Org/publish-node-action@1.0.1 runs `comfy --yes env`, which comfy-cli no longer
+      # accepts ("No such option: --yes", comfy-cli 1.22.0) — publish with a pinned CLI directly.
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          personal_access_token: ${{ secrets.REGISTRY_ACCESS_TOKEN }}
+          python-version: '3.10'
+      - run: pip install comfy-cli==1.22.0
+      - name: Publish to the Comfy Registry
+        env:
+          REGISTRY_ACCESS_TOKEN: ${{ secrets.REGISTRY_ACCESS_TOKEN }}
+        run: comfy --skip-prompt node publish --token "$REGISTRY_ACCESS_TOKEN"
