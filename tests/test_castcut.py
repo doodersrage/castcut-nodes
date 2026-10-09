@@ -17,6 +17,16 @@ import sys
 import tempfile
 import types
 import unittest
+import io
+
+
+def _png_bytes():
+    from PIL import Image  # noqa: PLC0415
+
+    buf = io.BytesIO()
+    Image.new("RGB", (8, 8)).save(buf, format="PNG")
+    return buf.getvalue()
+
 
 import numpy as np
 
@@ -554,6 +564,62 @@ class RouteHelperTests14(unittest.TestCase):
             with self.assertRaises(ValueError, msg=bad):
                 castcut.analyze_request(
                     {"op": "person-poses", "image": image, "model": bad}, None, Yes(), Yes()
+                )
+
+
+    def test_duo_counts_needs_its_nodes_checks_models_and_counts(self):
+        class Pose:
+            def available(self):
+                return True
+
+            def openpose_json(self, rgb, hands, body, face):
+                assert (hands, body, face) == (False, True, False)
+                return "[]"
+
+        class Reader:
+            def __init__(self, ok=True):
+                self.ok = ok
+                self.asked = None
+
+            def available(self):
+                return self.ok
+
+            def counts_available(self):
+                return self.ok
+
+            def counts(self, rgb, models, threshold):
+                self.asked = (models, threshold)
+                return {key: 2 for key in models}
+
+        image = {"data": base64.b64encode(_png_bytes()).decode()}
+        self.assertEqual(
+            castcut.analyze_request({"op": "duo-counts", "image": image}, None, Pose(), Reader(False)),
+            {"op": "duo-counts", "error": "no-duo-counts"},
+        )
+        reader = Reader()
+        reply = castcut.analyze_request(
+            {
+                "op": "duo-counts",
+                "image": image,
+                "threshold": 0.5,
+                "models": {
+                    "faces": {"model": "bbox/face_yolov8m.pt", "segm": False},
+                    "penises": {"model": "segm/nsfw-seg-penis-s.pt", "segm": True},
+                },
+            },
+            None,
+            Pose(),
+            reader,
+        )
+        self.assertEqual(reply, {"op": "duo-counts", "counts": {"faces": 2, "penises": 2}, "openpose_json": "[]"})
+        self.assertEqual(
+            reader.asked,
+            ({"faces": ("bbox/face_yolov8m.pt", False), "penises": ("segm/nsfw-seg-penis-s.pt", True)}, 0.5),
+        )
+        for models in ({"faces": {"model": "bbox/../x.pt"}}, {"elbows": {"model": "bbox/a.pt"}}, {"faces": {}}):
+            with self.assertRaises(ValueError, msg=str(models)):
+                castcut.analyze_request(
+                    {"op": "duo-counts", "image": image, "models": models}, None, Pose(), Reader()
                 )
 
 

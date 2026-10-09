@@ -26,7 +26,7 @@ always did.
 | `CastcutMaskRepair` | image, mask, fill `#rrggbb`, regrow edges, optional LoadImage mask | composite, repaired mask, report JSON |
 | `CastcutReport` | report JSON, optional alternate image | UI output `castcut` (read from `/history`), alternate saved to output |
 
-## Routes (1.2.0, more in 1.3.0, 1.4.0 and 1.5.0)
+## Routes (1.2.0, more in 1.3.0, 1.4.0, 1.5.0 and 1.6.0)
 
 The pack also adds HTTP routes to ComfyUI's server (`castcut_nodes.py`, "HTTP routes"). The app
 asks `GET /castcut/info` and falls back to queued graphs when a route is missing or fails.
@@ -42,6 +42,7 @@ asks `GET /castcut/info` and falls back to queued graphs when a route is missing
 | `POST /castcut/input-delete` (1.3.0) | delete the named files from `input/`: plain top-level names only, at least `minAgeSeconds` old (never under a day), not named by a running or pending job → deleted / skipped with reasons |
 | `GET /castcut/health` (1.3.0) | queue counts, free VRAM, loaded model classes, which analyzers are installed and loaded; from 1.4.0 `usage` — per route / op, how many calls were served or failed and their average time since ComfyUI started |
 | `POST /castcut/analyze` `person-poses` (1.4.0) | the app's two-person pose read: the Impact Pack's person segmentation (`SegmDetectorSEGS` with the YOLO model pinned to the CPU), each of the `count` largest people alone on grey (`ImpactSEGSOrderedFilter`, `SegsToCombinedMask`, ComfyUI's composite), DWPose on each → one `openpose_json` per person |
+| `POST /castcut/analyze` `duo-counts` (1.6.0) | the app's two-person still counts (duo-still-check.ts): `{image, models: {faces|hands|penises|vaginas: {model, segm}}, threshold}` → each model's `UltralyticsDetectorProvider` → `Bbox`/`SegmDetectorSEGS` → `ImpactCount_Elts_in_SEGS` count (YOLO pinned to the CPU), plus body-only DWPose `openpose_json`. Matches the queued graph's counts on 8 of 8 live stills; `error: no-duo-counts` when the Impact nodes are missing |
 | `GET /castcut/png-text` (1.4.0) | `?filename&subfolder&type&keys=prompt` — a PNG's text chunks (the graph it was made with) without sending the picture |
 | `POST /castcut/editor-workflow` (1.5.0) | `{name, workflow}` — stages an editor-format workflow as `example_workflows/castcut-<name>.json` (newest 20 kept) and answers `{source, template}`, so the app opens `?template=…&source=…` and ComfyUI loads it onto the canvas. `source: null` with `reason: single-file` (the pack is the loose `castcut_nodes.py`, which ComfyUI cannot serve templates for) or `restart` (the folder is new since ComfyUI started) |
 
@@ -96,7 +97,7 @@ setup. See [docs/castcut-nodes.md](https://github.com/doodersrage/castcut/blob/m
    ```
 
 Check `http://127.0.0.1:8188/object_info/CastcutPoseScore` returns the node; its `description`
-ends with `[castcut-nodes 1.5.0]`, which is how the app reads the installed version. To update,
+ends with `[castcut-nodes 1.6.0]`, which is how the app reads the installed version. To update,
 copy / pull / update again and restart. Install it one way only — a `castcut_nodes.py` file and a
 `castcut` folder side by side both load.
 

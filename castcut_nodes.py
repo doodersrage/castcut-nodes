@@ -32,7 +32,7 @@ try:  # numpy ships with ComfyUI; the pose functions below don't need it.
 except ImportError:  # pragma: no cover - only without numpy
     np = None
 
-CASTCUT_VERSION = "1.5.0"
+CASTCUT_VERSION = "1.6.0"
 
 # Every node's object_info `description` ends with this marker, so the app can tell which version
 # is installed without running anything (src/lib/castcut-nodes-setup.ts parses it). Keep the
@@ -1540,7 +1540,7 @@ ROUTES = (
     "png-text",
     "editor-workflow",
 )
-ANALYZE_OPS = ("face-distance", "face-boxes", "face-probe", "pose", "person-poses")
+ANALYZE_OPS = ("face-distance", "face-boxes", "face-probe", "pose", "person-poses", "duo-counts")
 # An input file younger than this is never deleted, whatever the request says.
 INPUT_DELETE_MIN_AGE_SECONDS = 86_400
 VIEW_TYPES = ("input", "output", "temp")
@@ -1784,6 +1784,27 @@ def analyze_request(body, analyzer, pose_analyzer=None, person_reader=None):
             count=max(1, min(4, int(body.get("count", 2)))),
         )
         return {"op": op, "openpose_json": texts}
+    if op == "duo-counts":
+        if (
+            pose_analyzer is None
+            or not pose_analyzer.available()
+            or person_reader is None
+            or not person_reader.available()
+            or not person_reader.counts_available()
+        ):
+            return {"op": op, "error": "no-duo-counts"}
+        models = {}
+        for key, spec in (body.get("models") or {}).items():
+            name = str((spec or {}).get("model") or "")
+            if key not in ("faces", "hands", "penises", "vaginas") or not name:
+                raise ValueError("Invalid models.")
+            if ".." in name or "/" in name.strip("/").split("/", 1)[-1]:
+                raise ValueError("Invalid model name.")
+            models[key] = (name, bool((spec or {}).get("segm")))
+        rgb = _load_rgb(body.get("image"))
+        counts = person_reader.counts(rgb, models, threshold=float(body.get("threshold", 0.5)))
+        pose = pose_analyzer.openpose_json(rgb, hands=False, body=True, face=False)
+        return {"op": op, "counts": counts, "openpose_json": pose}
     raise ValueError(f"Unknown op: {op}")
 
 
@@ -1969,15 +1990,30 @@ class PersonReader:
         )
         return all(name in nodes.NODE_CLASS_MAPPINGS for name in needed)
 
+    @staticmethod
+    def counts_available():
+        try:
+            import nodes  # noqa: PLC0415 - ComfyUI only
+        except Exception:  # noqa: BLE001
+            return False
+        needed = ("BboxDetectorSEGS", "SegmDetectorSEGS", "ImpactCount_Elts_in_SEGS")
+        return all(name in nodes.NODE_CLASS_MAPPINGS for name in needed)
+
     def _segm_detector(self, model_name):
-        if model_name not in self._detectors:
+        return self._detector(model_name, segm=True)
+
+    def _detector(self, model_name, segm):
+        key = (model_name, segm)
+        if key not in self._detectors:
             import nodes  # noqa: PLC0415 - ComfyUI only
 
             provider = nodes.NODE_CLASS_MAPPINGS["UltralyticsDetectorProvider"]()
-            _, segm = provider.doit(model_name)
-            real = getattr(segm, "bbox_model", None)
+            bbox, segm_detector = provider.doit(model_name)
+            detector = segm_detector if segm else bbox
+            real = getattr(detector, "bbox_model", None)
             if real is None:
-                raise RuntimeError(f"{model_name} is not a segmentation model.")
+                kind = "segmentation" if segm else "box"
+                raise RuntimeError(f"{model_name} is not a {kind} model.")
 
             class CpuYolo:
                 """The YOLO model, always asked to run on the CPU."""
@@ -1989,9 +2025,30 @@ class PersonReader:
                 def __getattr__(self, name):
                     return getattr(real, name)
 
-            segm.bbox_model = CpuYolo()
-            self._detectors[model_name] = segm
-        return self._detectors[model_name]
+            detector.bbox_model = CpuYolo()
+            self._detectors[key] = detector
+        return self._detectors[key]
+
+    def counts(self, rgb, models, threshold=0.5, dilation=0, crop_factor=1, drop_size=10):
+        """
+        The duo count graph's detector counts (duo-still-check.ts buildDuoCountGraph) in-process:
+        UltralyticsDetectorProvider → Bbox/SegmDetectorSEGS → ImpactCount_Elts_in_SEGS for each
+        `{key: (model_name, segm)}`. Same nodes and settings as the graph; YOLO on the CPU.
+        """
+        import torch  # noqa: PLC0415
+
+        import nodes  # noqa: PLC0415 - ComfyUI only
+
+        mappings = nodes.NODE_CLASS_MAPPINGS
+        image = torch.from_numpy(rgb.astype(np.float32) / 255.0)[None]
+        out = {}
+        with self._lock:
+            for key, (model_name, segm) in models.items():
+                detector = self._detector(model_name, segm)
+                node = mappings["SegmDetectorSEGS" if segm else "BboxDetectorSEGS"]()
+                segs = node.doit(detector, image, threshold, dilation, crop_factor, drop_size, "all")[0]
+                out[key] = int(mappings["ImpactCount_Elts_in_SEGS"]().doit(segs)[0])
+        return out
 
     def poses(self, rgb, pose_analyzer, model_name, count=2, threshold=0.35, dilation=6,
               crop_factor=1, drop_size=40, grey=0x808080):
@@ -2247,6 +2304,7 @@ def info_payload():
             "faceAnalysis": FaceAnalyzer.available(),
             "dwpose": PoseAnalyzer().available(),
             "personRead": PersonReader.available(),
+            "duoCounts": PersonReader.available() and PersonReader.counts_available(),
             "ops": list(ANALYZE_OPS),
         },
     }
