@@ -32,7 +32,7 @@ try:  # numpy ships with ComfyUI; the pose functions below don't need it.
 except ImportError:  # pragma: no cover - only without numpy
     np = None
 
-CASTCUT_VERSION = "1.6.0"
+CASTCUT_VERSION = "1.7.0"
 
 # Every node's object_info `description` ends with this marker, so the app can tell which version
 # is installed without running anything (src/lib/castcut-nodes-setup.ts parses it). Keep the
@@ -1495,12 +1495,71 @@ def save_images(images, filename_prefix, prompt=None, extra_pnginfo=None):
     return refs
 
 
+def _audio_db_levels(waveform, sample_rate, window_s=0.05):
+    """Per-window loudness (dB) of a [batch, channels, samples] waveform, channels mixed down."""
+    data = waveform.detach().cpu().numpy() if hasattr(waveform, "detach") else np.asarray(waveform)
+    mono = np.asarray(data, dtype=np.float64).reshape(-1, data.shape[-1]).mean(axis=0)
+    hop = max(1, int(sample_rate * window_s))
+    usable = (len(mono) // hop) * hop
+    if usable == 0:
+        return np.array([10 * math.log10(float(np.mean(mono**2)) + 1e-12)]) if len(mono) else np.array([-120.0])
+    power = (mono[:usable].reshape(-1, hop) ** 2).mean(axis=1)
+    return 10 * np.log10(power + 1e-12)
+
+
+def audio_match_level(audio, reference, offset_db=-15.0, max_gain_db=40.0, silent_db=-70.0):
+    """Scale `audio` to sit `offset_db` under the spoken level of `reference`.
+
+    The reference (a voice) is measured over its loudest 30% of 50 ms windows, so pauses between
+    words don't pull it down; the audio (a room bed) over all of it. A near-silent bed stays as it
+    is — it is never pumped up from nothing — and the gain is capped. Returns (audio, gain_db).
+    """
+    ref = _audio_db_levels(reference["waveform"], reference["sample_rate"])
+    ref_db = float(np.mean(np.sort(ref)[-max(1, int(len(ref) * 0.3)):]))
+    bed = _audio_db_levels(audio["waveform"], audio["sample_rate"])
+    bed_db = 10 * math.log10(float(np.mean(10 ** (bed / 10))) + 1e-12)
+    if bed_db < silent_db:
+        return audio, 0.0
+    gain_db = max(-max_gain_db, min(max_gain_db, ref_db + offset_db - bed_db))
+    scaled = dict(audio)
+    scaled["waveform"] = audio["waveform"] * (10 ** (gain_db / 20))
+    return scaled, gain_db
+
+
+class CastcutAudioMatchLevel:
+    """Scale a sound under another one's spoken level (a room bed under a talking clip's voice)."""
+
+    DESCRIPTION = _describe(
+        "Scale audio to sit offset_db under the reference's spoken level (room sound under a voice)."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "audio": ("AUDIO",),
+                "reference": ("AUDIO",),
+                "offset_db": ("FLOAT", {"default": -15.0, "min": -60.0, "max": 0.0, "step": 0.5}),
+            },
+        }
+
+    RETURN_TYPES = ("AUDIO", "FLOAT")
+    RETURN_NAMES = ("audio", "gain_db")
+    FUNCTION = "match"
+    CATEGORY = CATEGORY
+
+    def match(self, audio, reference, offset_db=-15.0):
+        scaled, gain = audio_match_level(audio, reference, offset_db=offset_db)
+        return (scaled, float(gain))
+
+
 NODE_CLASS_MAPPINGS = {
     "CastcutPoseScore": CastcutPoseScore,
     "CastcutPickBest": CastcutPickBest,
     "CastcutFaceDistance": CastcutFaceDistance,
     "CastcutMaskRepair": CastcutMaskRepair,
     "CastcutReport": CastcutReport,
+    "CastcutAudioMatchLevel": CastcutAudioMatchLevel,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1509,6 +1568,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "CastcutFaceDistance": "Castcut Face Distance",
     "CastcutMaskRepair": "Castcut Mask Repair",
     "CastcutReport": "Castcut Report",
+    "CastcutAudioMatchLevel": "Castcut Audio Match Level",
 }
 
 

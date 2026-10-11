@@ -25,6 +25,7 @@ always did.
 | `CastcutFaceDistance` | `ANALYSIS_MODELS` (ComfyUI_FaceAnalysis), reference, images | cosine distance per image (100 = no face) |
 | `CastcutMaskRepair` | image, mask, fill `#rrggbb`, regrow edges, optional LoadImage mask | composite, repaired mask, report JSON |
 | `CastcutReport` | report JSON, optional alternate image | UI output `castcut` (read from `/history`), alternate saved to output |
+| `CastcutAudioMatchLevel` (1.7.0) | `AUDIO`, reference `AUDIO`, `offset_db` (default −15) | the audio scaled to sit `offset_db` under the reference's spoken level (its loudest 30% of 50 ms windows), and the gain in dB; a near-silent input (under −70 dB) is left as it is, the gain is capped at ±40 dB — Castcut's room sound under a talking clip's voice |
 
 ## Routes (1.2.0, more in 1.3.0, 1.4.0, 1.5.0 and 1.6.0)
 

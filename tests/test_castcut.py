@@ -262,6 +262,50 @@ class Report(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(out_dir, "castcut-alt_00007_.png")))
 
 
+class AudioMatchLevel(unittest.TestCase):
+    """A room bed under a talking clip's voice: placed by the voice's spoken level."""
+
+    SR = 16000
+
+    def _db(self, x):
+        return 10 * math.log10(float(np.mean(np.asarray(x, dtype=np.float64) ** 2)) + 1e-12)
+
+    def _voice(self):
+        # 1 s of "speech" at -20 dB RMS, then 1 s of pause (the level must ignore the pause).
+        t = np.arange(self.SR) / self.SR
+        speech = 0.1 * math.sqrt(2) * np.sin(2 * math.pi * 220 * t)
+        return {"waveform": np.concatenate([speech, np.zeros(self.SR)])[None, None, :], "sample_rate": self.SR}
+
+    def _bed(self, rms):
+        rng = np.random.default_rng(1)
+        noise = rng.standard_normal(2 * self.SR)
+        noise *= rms / np.sqrt(np.mean(noise**2))
+        return {"waveform": noise[None, None, :], "sample_rate": self.SR}
+
+    def test_puts_a_quiet_bed_15_db_under_the_spoken_level(self):
+        out, gain = castcut.audio_match_level(self._bed(10 ** (-60 / 20)), self._voice(), offset_db=-15)
+        self.assertAlmostEqual(self._db(out["waveform"]), -35, delta=0.6)
+        self.assertAlmostEqual(gain, 25, delta=0.6)
+
+    def test_turns_a_loud_bed_down(self):
+        out, gain = castcut.audio_match_level(self._bed(10 ** (-14 / 20)), self._voice(), offset_db=-15)
+        self.assertAlmostEqual(self._db(out["waveform"]), -35, delta=0.6)
+        self.assertLess(gain, 0)
+
+    def test_leaves_a_silent_bed_silent_and_caps_the_gain(self):
+        silent = {"waveform": np.zeros((1, 1, self.SR)), "sample_rate": self.SR}
+        out, gain = castcut.audio_match_level(silent, self._voice())
+        self.assertEqual(gain, 0.0)
+        self.assertEqual(float(np.abs(out["waveform"]).max()), 0.0)
+        _, capped = castcut.audio_match_level(self._bed(10 ** (-68 / 20)), self._voice(), offset_db=0)
+        self.assertLessEqual(capped, 40.0)
+
+    def test_node_returns_audio_and_gain(self):
+        audio, gain = castcut.CastcutAudioMatchLevel().match(self._bed(10 ** (-50 / 20)), self._voice(), -15)
+        self.assertIn("waveform", audio)
+        self.assertAlmostEqual(gain, 15, delta=0.6)
+
+
 class Registration(unittest.TestCase):
     def test_every_node_declares_the_comfy_api(self):
         self.assertEqual(set(castcut.NODE_CLASS_MAPPINGS), set(castcut.NODE_DISPLAY_NAME_MAPPINGS))
