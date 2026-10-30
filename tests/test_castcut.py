@@ -111,7 +111,11 @@ class PoseScoreVectors(unittest.TestCase):
                     for body in case["guide"]["people"]
                 ]
                 actual = castcut.score_pose_match(
-                    guide, case["guide"]["aspect"], detected, case.get("method", "limb-angle")
+                    guide,
+                    case["guide"]["aspect"],
+                    detected,
+                    case.get("method", "limb-angle"),
+                    custom_pose=case.get("customPose") is True,
                 )
                 assert_close(self, case["expected"], actual)
                 exact += same(case["expected"], actual)
@@ -709,3 +713,38 @@ class EditorWorkflowTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Transcribe(unittest.TestCase):
+    def _audio(self, amplitude, seconds=2.0, rate=24000):
+        t = np.arange(int(seconds * rate)) / rate
+        wave = (amplitude * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
+        return {"waveform": wave.reshape(1, 1, -1), "sample_rate": rate}
+
+    def test_silence_is_empty_without_whisper(self):
+        called = []
+        text = castcut.transcribe_audio(self._audio(1e-4), _pipeline=lambda *a, **k: called.append(1))
+        self.assertEqual(text, "")
+        self.assertEqual(called, [])
+
+    def test_speech_goes_to_whisper_at_16k(self):
+        seen = {}
+
+        def fake(inputs, generate_kwargs=None):
+            seen["rate"] = inputs["sampling_rate"]
+            seen["len"] = len(inputs["raw"])
+            seen["kwargs"] = generate_kwargs
+            return {"text": "  Hi there.  "}
+
+        text = castcut.transcribe_audio(self._audio(0.3), language="en", _pipeline=fake)
+        self.assertEqual(text, "Hi there.")
+        self.assertEqual(seen["rate"], 16000)
+        self.assertEqual(seen["len"], 32000)
+        self.assertEqual(seen["kwargs"], {"language": "en", "task": "transcribe"})
+
+    def test_node_reports_the_text(self):
+        node = castcut.CastcutTranscribe()
+        castcut._TRANSCRIBERS["fake"] = lambda inputs, generate_kwargs=None: {"text": "Hello."}
+        out = node.transcribe(self._audio(0.3), model="fake")
+        self.assertEqual(out["ui"]["castcut_text"], ["Hello."])
+        self.assertEqual(out["result"], ("Hello.",))

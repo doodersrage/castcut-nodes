@@ -26,6 +26,7 @@ always did.
 | `CastcutMaskRepair` | image, mask, fill `#rrggbb`, regrow edges, optional LoadImage mask | composite, repaired mask, report JSON |
 | `CastcutReport` | report JSON, optional alternate image | UI output `castcut` (read from `/history`), alternate saved to output |
 | `CastcutAudioMatchLevel` (1.7.0) | `AUDIO`, reference `AUDIO`, `offset_db` (default −15) | the audio scaled to sit `offset_db` under the reference's spoken level (its loudest 30% of 50 ms windows), and the gain in dB; a near-silent input (under −70 dB) is left as it is, the gain is capped at ±40 dB — Castcut's room sound under a talking clip's voice |
+| `CastcutTranscribe` (1.8.0) | `AUDIO`, model (`openai/whisper-base` / `-small`), language | what it says, as text — also in the job's history (`castcut_text`); near-silent audio gives `''` (Whisper makes words up on room tone). Castcut checks a talking part said its line and nothing more. Uses ComfyUI's own `transformers`; the model downloads on first use (~290 MB) |
 
 ## Routes (1.2.0, more in 1.3.0, 1.4.0, 1.5.0 and 1.6.0)
 

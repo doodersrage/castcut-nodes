@@ -32,7 +32,7 @@ try:  # numpy ships with ComfyUI; the pose functions below don't need it.
 except ImportError:  # pragma: no cover - only without numpy
     np = None
 
-CASTCUT_VERSION = "1.7.0"
+CASTCUT_VERSION = "1.8.0"
 
 # Every node's object_info `description` ends with this marker, so the app can tell which version
 # is installed without running anything (src/lib/castcut-nodes-setup.ts parses it). Keep the
@@ -294,6 +294,9 @@ def classify_posture(body, aspect):
     if foreshortened:
         if feet_drop is not None and feet_drop >= 1.4 and knee_drop >= 0.6:
             return _read("standing", False, facing, tilt)
+        # Feet well under the hips, knees below them, the torso short: leaning toward the camera.
+        if feet_drop is not None and feet_drop >= 0.9 and knee_drop >= 0.25:
+            return _read("bending", False, facing, tilt)
         return _read("unknown", False, facing, tilt)
     near_tilt = tilt > LYING_TILT_DEG - TILT_MARGIN_DEG
     if knee_drop < SEATED_KNEE_DROP:
@@ -301,6 +304,8 @@ def classify_posture(body, aspect):
             angle = _knee_angle_deg(support["hip"], support["knee"], support["ankle"])
             if 0.25 < feet_drop < 0.75 and angle < 80:
                 return _read("crouching", False, facing, tilt)
+            if _is_squat(full, hip, ref):
+                return _read("crouching", not near_tilt, facing, tilt)
         return _read(
             "sitting", (not near_tilt) and knee_drop < SEATED_KNEE_DROP - DROP_MARGIN, facing, tilt
         )
@@ -308,7 +313,21 @@ def classify_posture(body, aspect):
         return _read("bending" if tilt > 25 else "standing", False, facing, tilt)
     lowest_knee = max(leg["knee"]["y"] for leg in with_knee)
     shin_drop = (support["ankle"]["y"] - lowest_knee) / ref
-    if shin_drop < KNEELING_SHIN_DROP:
+    # A straight leg standing upright under the hip, longer than the other thigh: not kneeling.
+    down_knee = None
+    for leg in with_knee:
+        if down_knee is None or leg["knee"]["y"] > down_knee["knee"]["y"]:
+            down_knee = leg
+    standing_leg = any(
+        leg is not down_knee
+        and leg["knee"]["y"] < down_knee["knee"]["y"] - 0.1 * ref
+        and leg["ankle"]["y"] >= support["ankle"]["y"] - 0.1 * ref
+        and _knee_angle_deg(leg["hip"], leg["knee"], leg["ankle"]) > 155
+        and _from_down_deg(leg["hip"], leg["ankle"]) < 25
+        and _dist(leg["hip"], leg["ankle"]) > 1.15 * _dist(down_knee["hip"], down_knee["knee"])
+        for leg in full
+    )
+    if shin_drop < KNEELING_SHIN_DROP and not standing_leg:
         return _read(
             "kneeling",
             (not near_tilt) and shin_drop < KNEELING_SHIN_DROP - DROP_MARGIN,
@@ -328,23 +347,87 @@ def classify_posture(body, aspect):
     return _read("standing", confident_stand and tilt <= 20, facing, tilt)
 
 
+SQUAT_SHIN_DEG = 30
+SQUAT_KNEE_DEG = 80
+SQUAT_HIP_OVER_FEET = 0.45
+FACE_UP = 0.08
+FACE_DOWN = 0.1
+STACKED_SHOULDERS = 0.3
+
+
+def _is_squat(legs, hip, ref):
+    """Knees folded tight, a shin tipped forward, the hips over the feet: a squat, not a seat."""
+    if not legs:
+        return False
+    knees = [_knee_angle_deg(leg["hip"], leg["knee"], leg["ankle"]) for leg in legs]
+    shins = [180 - _from_down_deg(leg["ankle"], leg["knee"]) for leg in legs]
+    feet_x = 0.0
+    for leg in legs:
+        feet_x += leg["ankle"]["x"]
+    feet_x /= len(legs)
+    return (
+        min(knees) < SQUAT_KNEE_DEG
+        and max(shins) > SQUAT_SHIN_DEG
+        and abs(hip["x"] - feet_x) < SQUAT_HIP_OVER_FEET * ref
+    )
+
+
 def _lying_kind(body, aspect, ref):
+    """On the back, side or front: a knee bent up, feet kicked up behind, propped on the
+    forearms, the face against the ears, then the shoulder line (posture.ts lyingKind)."""
     p = _scaled(body, aspect)
     rs = p(R_SHOULDER)
     ls = p(L_SHOULDER)
     neck = p(NECK)
+    hip = _mean([p(R_HIP), p(L_HIP)])
+    legs = []
+    for h, k, a in ((R_HIP, R_KNEE, R_ANKLE), (L_HIP, L_KNEE, L_ANKLE)):
+        leg_hip = p(h) or hip
+        knee = p(k)
+        ankle = p(a)
+        if knee and ankle and leg_hip:
+            legs.append({"hip": leg_hip, "knee": knee, "ankle": ankle})
+    if any(leg["knee"]["y"] < min(leg["hip"]["y"], leg["ankle"]["y"]) - 0.18 * ref for leg in legs):
+        return "lying-back"
+    if (
+        legs
+        and all(leg["knee"]["y"] > leg["hip"]["y"] - 0.15 * ref for leg in legs)
+        and any(
+            leg["ankle"]["y"] < leg["knee"]["y"] - 0.3 * ref
+            and leg["ankle"]["y"] < leg["hip"]["y"] - 0.2 * ref
+            for leg in legs
+        )
+    ):
+        return "lying-front"
     elbows = [point for point in (p(3), p(6)) if point is not None]
     shoulders = _mean([rs, ls])
     nose = p(NOSE)
-    if (
-        shoulders
-        and neck
-        and nose
-        and len(elbows) == 2
-        and all(elbow["y"] > shoulders["y"] + 0.2 * ref for elbow in elbows)
-        and nose["y"] < neck["y"] - 0.1 * ref
-    ):
-        return "lying-front"
+    if shoulders and neck and hip and nose and len(elbows) == 2:
+        torso = _dist(neck, hip) or 1
+
+        def along(point):
+            return (
+                (point["x"] - neck["x"]) * (neck["x"] - hip["x"])
+                + (point["y"] - neck["y"]) * (neck["y"] - hip["y"])
+            ) / torso
+
+        if (
+            all(
+                elbow["y"] > shoulders["y"] + 0.2 * ref and along(elbow) > -0.2 * ref
+                for elbow in elbows
+            )
+            and nose["y"] < neck["y"] - 0.1 * ref
+        ):
+            return "lying-front"
+    ear_line = _mean([p(16), p(17)])
+    if nose and ear_line:
+        nose_up = (ear_line["y"] - nose["y"]) / ref
+        if nose_up > FACE_UP:
+            return "lying-back"
+        if nose_up < -FACE_DOWN:
+            if rs and ls and abs(rs["y"] - ls["y"]) >= STACKED_SHOULDERS * ref:
+                return "lying-side"
+            return "lying-front"
     if rs and ls and _dist(rs, ls) < SIDE_SHOULDER_SHARE * ref:
         return "lying-side"
     return "lying-back"
@@ -613,6 +696,10 @@ HEADCOUNT_MIN_PROMINENCE = 0.3
 LIMB_ANGLE_MIN_POSE_MATCH = 0.5
 JOINT_DISTANCE_MIN_POSE_MATCH = 0.6
 POSE_MISS_SCORE_CAP = _js_round(LIMB_ANGLE_MIN_POSE_MATCH * 0.8 * 100) / 100
+# A custom pose (joint editor, a photo): limbs under this miss (score.ts CUSTOM_POSE_MIN_LIMB_SCORE).
+CUSTOM_POSE_MIN_LIMB_SCORE = 0.75
+# A limb-only miss tops out just under the gate, in proportion to its limbs (LIMB_MISS_SCORE_TOP).
+LIMB_MISS_SCORE_TOP = _js_round((LIMB_ANGLE_MIN_POSE_MATCH - 0.01) * 100) / 100
 
 
 def _parse_body(raw, width, height, normalized):
@@ -768,15 +855,20 @@ def count_prominent_people(detected):
     )
 
 
-def limb_verdict_score(limb_score, miss):
+def limb_verdict_score(limb_score, miss, limbs_only=False):
     limb = max(0.0, min(1.0, limb_score))
-    if miss:
-        return limb * POSE_MISS_SCORE_CAP
-    return LIMB_ANGLE_MIN_POSE_MATCH + (1 - LIMB_ANGLE_MIN_POSE_MATCH) * limb
+    if not miss:
+        return LIMB_ANGLE_MIN_POSE_MATCH + (1 - LIMB_ANGLE_MIN_POSE_MATCH) * limb
+    if limbs_only:
+        return LIMB_MISS_SCORE_TOP * min(1.0, limb / CUSTOM_POSE_MIN_LIMB_SCORE)
+    return limb * POSE_MISS_SCORE_CAP
 
 
-def score_pose_match(guide_people, guide_aspect, detected, method="limb-angle"):
-    """Port of `scorePoseMatch`: the same PoseMatchResult shape (camelCase keys)."""
+def score_pose_match(guide_people, guide_aspect, detected, method="limb-angle", custom_pose=False):
+    """Port of `scorePoseMatch`: the same PoseMatchResult shape (camelCase keys).
+
+    `custom_pose`: the guide is a custom pose (joint editor, a photo) — its limbs are the check
+    too, under CUSTOM_POSE_MIN_LIMB_SCORE a miss (`limbMiss`)."""
     canvas = detected["canvas"]
     detected_aspect = (
         canvas["width"] / canvas["height"]
@@ -857,16 +949,24 @@ def score_pose_match(guide_people, guide_aspect, detected, method="limb-angle"):
             total += value
         limb_score = total / len(read_limbs)
     anyone = any(pick(g) >= 0 for g in range(len(guide)))
+    limb_miss = (
+        method == "limb-angle"
+        and custom_pose is True
+        and len(read_limbs) > 0
+        and limb_score < CUSTOM_POSE_MIN_LIMB_SCORE
+    )
     if method != "limb-angle":
         score = joint_score
     elif read_limbs:
-        score = limb_verdict_score(limb_score, posture_miss)
+        score = limb_verdict_score(
+            limb_score, posture_miss or limb_miss, limb_miss and not posture_miss
+        )
     elif anyone and not posture_miss:
         score = LIMB_ANGLE_MIN_POSE_MATCH
     else:
         score = 0.0
     lead = limb[0][pick(0)] if guide and pick(0) >= 0 else None
-    return {
+    result = {
         "score": _round2(score),
         "method": method,
         "jointScore": _round2(joint_score),
@@ -887,6 +987,9 @@ def score_pose_match(guide_people, guide_aspect, detected, method="limb-angle"):
         "offLimbs": lead["off"] if lead else [],
         "limbDeltas": lead["limbs"] if lead else [],
     }
+    if custom_pose is True:
+        result["limbMiss"] = limb_miss
+    return result
 
 
 def parse_guide(raw):
@@ -1553,6 +1656,73 @@ class CastcutAudioMatchLevel:
         return (scaled, float(gain))
 
 
+# Whisper pipelines, one per model, loaded on first use (transformers is ComfyUI's own).
+_TRANSCRIBERS = {}
+#: Below this loudness (dB, its loudest 30% of 50 ms windows) a clip is taken as silent: Whisper
+#: makes words up on room tone ("Thank you for watching." on a wordless balcony clip, live).
+TRANSCRIBE_SILENT_DB = -50.0
+
+
+def transcribe_audio(audio, model="openai/whisper-base", language="en", _pipeline=None):
+    """What `audio` says, as text ('' when it is silent). `_pipeline` replaces Whisper in tests."""
+    levels = _audio_db_levels(audio["waveform"], audio["sample_rate"])
+    loud = float(np.mean(np.sort(levels)[-max(1, int(len(levels) * 0.3)):]))
+    if loud < TRANSCRIBE_SILENT_DB:
+        return ""
+    data = audio["waveform"]
+    data = data.detach().cpu().numpy() if hasattr(data, "detach") else np.asarray(data)
+    mono = np.asarray(data, dtype=np.float32).reshape(-1, data.shape[-1]).mean(axis=0)
+    rate = int(audio["sample_rate"])
+    if rate != 16000:
+        count = int(round(len(mono) * 16000 / rate))
+        mono = np.interp(np.linspace(0, len(mono) - 1, count), np.arange(len(mono)), mono).astype(np.float32)
+    asr = _pipeline
+    if asr is None:
+        if model not in _TRANSCRIBERS:
+            import torch
+            from transformers import pipeline
+
+            _TRANSCRIBERS[model] = pipeline(
+                "automatic-speech-recognition",
+                model=model,
+                device=0 if torch.cuda.is_available() else -1,
+            )
+        asr = _TRANSCRIBERS[model]
+    result = asr(
+        {"raw": mono, "sampling_rate": 16000},
+        generate_kwargs={"language": language, "task": "transcribe"},
+    )
+    return str(result.get("text", "") if isinstance(result, dict) else result).strip()
+
+
+class CastcutTranscribe:
+    """What a clip says (Whisper): Castcut checks a talking part said its line and nothing more."""
+
+    DESCRIPTION = _describe(
+        "Transcribe audio with Whisper (transformers). Silent audio gives ''. The text is also in the job's history (ui castcut_text)."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "audio": ("AUDIO",),
+                "model": (["openai/whisper-base", "openai/whisper-small"], {"default": "openai/whisper-base"}),
+                "language": ("STRING", {"default": "en"}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
+    FUNCTION = "transcribe"
+    CATEGORY = CATEGORY
+    OUTPUT_NODE = True
+
+    def transcribe(self, audio, model="openai/whisper-base", language="en"):
+        text = transcribe_audio(audio, model=model, language=(language or "en").strip() or "en")
+        return {"ui": {"castcut_text": [text]}, "result": (text,)}
+
+
 NODE_CLASS_MAPPINGS = {
     "CastcutPoseScore": CastcutPoseScore,
     "CastcutPickBest": CastcutPickBest,
@@ -1560,6 +1730,7 @@ NODE_CLASS_MAPPINGS = {
     "CastcutMaskRepair": CastcutMaskRepair,
     "CastcutReport": CastcutReport,
     "CastcutAudioMatchLevel": CastcutAudioMatchLevel,
+    "CastcutTranscribe": CastcutTranscribe,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1569,6 +1740,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "CastcutMaskRepair": "Castcut Mask Repair",
     "CastcutReport": "Castcut Report",
     "CastcutAudioMatchLevel": "Castcut Audio Match Level",
+    "CastcutTranscribe": "Castcut Transcribe",
 }
 
 
