@@ -32,7 +32,7 @@ try:  # numpy ships with ComfyUI; the pose functions below don't need it.
 except ImportError:  # pragma: no cover - only without numpy
     np = None
 
-CASTCUT_VERSION = "1.9.0"
+CASTCUT_VERSION = "1.10.0"
 
 # Every node's object_info `description` ends with this marker, so the app can tell which version
 # is installed without running anything (src/lib/castcut-nodes-setup.ts parses it). Keep the
@@ -1723,6 +1723,118 @@ class CastcutTranscribe:
         return {"ui": {"castcut_text": [text]}, "result": (text,)}
 
 
+QWEN21_ENCODE_IMAGES = 8
+# A reference's VAE latent, by its pixels: a scene's plate and room repeat across its shots.
+_REF_LATENTS: "OrderedDict[tuple, object]" = None  # created on first use
+_REF_LATENTS_MAX = 24
+
+
+def qwen21_reference_size(width, height, resolution):
+    """The size TextEncodeQwenImage21 resizes a reference to (multiples of 32, about resolution²)."""
+    if resolution > 0:
+        ratio = width / height
+        w = round(math.sqrt(resolution * resolution * ratio) / 32) * 32
+        h = round(math.sqrt(resolution * resolution / ratio) / 32) * 32
+    else:
+        w, h = round(width / 32) * 32, round(height / 32) * 32
+    return max(32, w), max(32, h)
+
+
+def _ref_latent(vae, pixels):
+    """vae.encode(pixels), reused when the same VAE saw the same pixels lately."""
+    global _REF_LATENTS
+    import hashlib
+    from collections import OrderedDict
+
+    if _REF_LATENTS is None:
+        _REF_LATENTS = OrderedDict()
+    data = pixels.detach().cpu().contiguous().numpy().tobytes()
+    key = (id(vae), tuple(pixels.shape), hashlib.blake2b(data, digest_size=16).hexdigest())
+    hit = _REF_LATENTS.get(key)
+    if hit is not None:
+        _REF_LATENTS.move_to_end(key)
+        return hit
+    latent = vae.encode(pixels)
+    _REF_LATENTS[key] = latent
+    while len(_REF_LATENTS) > _REF_LATENTS_MAX:
+        _REF_LATENTS.popitem(last=False)
+    return latent
+
+
+class CastcutEncodeQwenImage21:
+    """TextEncodeQwenImage21 for cfg 1: the prompt with its pictures encoded once, not twice.
+
+    The core node also encodes the negative prompt with every reference picture: a second full
+    pass of the vision-language encoder that a cfg-1 sampler (BasicGuider, KSampler at cfg 1)
+    never reads. Here the negative is the empty prompt without pictures (cheap), carrying the
+    same reference latents. Reference latents are reused across jobs by their pixels.
+    """
+
+    DESCRIPTION = _describe(
+        "Text Encode Qwen Image 2.1 for cfg-1 sampling: the negative is not encoded with the pictures (it is unused at cfg 1), and each reference's VAE latent is reused across jobs. Same resize, conditioning and latent as the core node."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        optional = {"vae": ("VAE",)}
+        for index in range(1, QWEN21_ENCODE_IMAGES + 1):
+            optional[f"image_{index}"] = ("IMAGE",)
+        return {
+            "required": {
+                "clip": ("CLIP",),
+                "prompt": ("STRING", {"multiline": True, "dynamicPrompts": True}),
+                "resolution": ("INT", {"default": 1024, "min": 0, "max": 4096, "step": 32}),
+            },
+            "optional": optional,
+        }
+
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING", "LATENT")
+    RETURN_NAMES = ("positive", "negative", "latent")
+    FUNCTION = "encode"
+    CATEGORY = CATEGORY
+
+    def encode(self, clip, prompt, resolution=1024, vae=None, **images):
+        import torch
+        import comfy.model_management
+        import comfy.utils
+        import node_helpers
+
+        ref_latents = []
+        images_vl = []
+        latent_w = latent_h = resolution or 1024
+        for index in range(1, QWEN21_ENCODE_IMAGES + 1):
+            image = images.get(f"image_{index}")
+            if image is None:
+                continue
+            samples = image[:1].movedim(-1, 1)
+            width, height = qwen21_reference_size(samples.shape[3], samples.shape[2], resolution)
+            if (width, height) == (samples.shape[3], samples.shape[2]):
+                pixels = image[:1]
+            else:
+                pixels = comfy.utils.common_upscale(samples, width, height, "lanczos", "disabled").movedim(1, -1)
+            if not images_vl:
+                latent_w, latent_h = width, height
+            rgb = pixels[:, :, :, :3]
+            if pixels.shape[-1] > 3:
+                rgb = rgb * pixels[:, :, :, 3:] + (1.0 - pixels[:, :, :, 3:])
+            images_vl.append(rgb)
+            if vae is not None:
+                ref_latents.append(_ref_latent(vae, pixels))
+
+        keep_vision = len(ref_latents) == 0
+        positive = clip.encode_from_tokens_scheduled(
+            clip.tokenize(prompt, images=images_vl, keep_vision=keep_vision, prevent_empty_text=True)
+        )
+        negative = clip.encode_from_tokens_scheduled(clip.tokenize("", prevent_empty_text=True))
+        if ref_latents:
+            positive = node_helpers.conditioning_set_values(positive, {"reference_latents": ref_latents}, append=True)
+            negative = node_helpers.conditioning_set_values(negative, {"reference_latents": ref_latents}, append=True)
+        latent = torch.zeros(
+            [1, 64, latent_h // 16, latent_w // 16], device=comfy.model_management.intermediate_device()
+        )
+        return (positive, negative, {"samples": latent})
+
+
 NODE_CLASS_MAPPINGS = {
     "CastcutPoseScore": CastcutPoseScore,
     "CastcutPickBest": CastcutPickBest,
@@ -1731,6 +1843,7 @@ NODE_CLASS_MAPPINGS = {
     "CastcutReport": CastcutReport,
     "CastcutAudioMatchLevel": CastcutAudioMatchLevel,
     "CastcutTranscribe": CastcutTranscribe,
+    "CastcutEncodeQwenImage21": CastcutEncodeQwenImage21,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1741,6 +1854,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "CastcutReport": "Castcut Report",
     "CastcutAudioMatchLevel": "Castcut Audio Match Level",
     "CastcutTranscribe": "Castcut Transcribe",
+    "CastcutEncodeQwenImage21": "Castcut Encode Qwen Image 2.1 (cfg 1)",
 }
 
 

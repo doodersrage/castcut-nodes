@@ -816,3 +816,103 @@ class StageTimerTests(unittest.TestCase):
         server.send_sync("execution_start", {"prompt_id": "p9"}, "client-a")
         self.assertEqual(sent, [("execution_start", "client-a")])
         self.assertIsNotNone(timer.timings("p9"))
+
+
+class EncodeQwenImage21Tests(unittest.TestCase):
+    """ENGINE_PLAN.md phase 2: a cfg-1 encode reads the pictures once, not for the negative too."""
+
+    class _Pixels:
+        """Just enough of an image tensor: [1, h, w, c]."""
+
+        def __init__(self, h, w, c=3, fill=0.5):
+            self.shape = (1, h, w, c)
+            self.fill = fill
+
+        def __getitem__(self, key):
+            return self
+
+        def movedim(self, *_):
+            return CastcutEncodeShim(self)
+
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def contiguous(self):
+            return self
+
+        def numpy(self):
+            return np.full((2, 2), self.fill, dtype=np.float32)
+
+    def setUp(self):
+        self.calls = []
+        test = self
+
+        class Clip:
+            def tokenize(self, text, **kwargs):
+                test.calls.append((text, len(kwargs.get("images") or [])))
+                return text
+
+            def encode_from_tokens_scheduled(self, tokens):
+                return [[tokens, {}]]
+
+        class Vae:
+            encodes = 0
+
+            def encode(self, pixels):
+                Vae.encodes += 1
+                return f"latent{Vae.encodes}"
+
+        self.clip, self.vae = Clip(), Vae()
+        stubs = {
+            "torch": types.SimpleNamespace(zeros=lambda shape, device=None: ("zeros", tuple(shape))),
+            "comfy": types.ModuleType("comfy"),
+            "comfy.model_management": types.SimpleNamespace(intermediate_device=lambda: "cpu"),
+            "comfy.utils": types.SimpleNamespace(common_upscale=lambda samples, w, h, *_: samples),
+            "node_helpers": types.SimpleNamespace(
+                conditioning_set_values=lambda cond, values, append=False: [[c[0], {**c[1], **values}] for c in cond]
+            ),
+        }
+        stubs["comfy"].utils = stubs["comfy.utils"]
+        stubs["comfy"].model_management = stubs["comfy.model_management"]
+        self._saved = {name: sys.modules.get(name) for name in stubs}
+        sys.modules.update(stubs)
+        castcut._REF_LATENTS = None
+
+    def tearDown(self):
+        for name, module in self._saved.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+    def test_resizes_like_the_core_node(self):
+        self.assertEqual(castcut.qwen21_reference_size(1472, 1104, 1280), (1472, 1120))
+        self.assertEqual(castcut.qwen21_reference_size(1104, 1472, 1280), (1120, 1472))
+        self.assertEqual(castcut.qwen21_reference_size(1000, 1000, 0), (992, 992))
+
+    def test_pictures_go_to_the_prompt_only_and_latents_are_reused(self):
+        node = castcut.CastcutEncodeQwenImage21()
+        plate, room = self._Pixels(1104, 1472, fill=0.1), self._Pixels(1104, 1472, fill=0.2)
+        positive, negative, latent = node.encode(self.clip, "a prompt", 1280, self.vae, image_1=plate, image_3=room)
+        self.assertEqual(self.calls, [("a prompt", 2), ("", 0)])
+        self.assertEqual(positive[0][1]["reference_latents"], ["latent1", "latent2"])
+        self.assertEqual(negative[0][1]["reference_latents"], ["latent1", "latent2"])
+        self.assertEqual(latent["samples"], ("zeros", (1, 64, 1120 // 16, 1472 // 16)))
+        # The next shot of the scene: the same plate is not encoded again.
+        node.encode(self.clip, "next", 1280, self.vae, image_1=self._Pixels(1104, 1472, fill=0.1))
+        self.assertEqual(self.vae.encodes, 2)
+
+
+class CastcutEncodeShim:
+    """The [1, c, h, w] view of a _Pixels (movedim), for the resize's shape reads."""
+
+    def __init__(self, pixels):
+        _, h, w, c = pixels.shape
+        self.shape = (1, c, h, w)
+        self.pixels = pixels
+
+    def movedim(self, *_):
+        return self.pixels
