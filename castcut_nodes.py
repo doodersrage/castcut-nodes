@@ -32,7 +32,7 @@ try:  # numpy ships with ComfyUI; the pose functions below don't need it.
 except ImportError:  # pragma: no cover - only without numpy
     np = None
 
-CASTCUT_VERSION = "1.8.0"
+CASTCUT_VERSION = "1.9.0"
 
 # Every node's object_info `description` ends with this marker, so the app can tell which version
 # is installed without running anything (src/lib/castcut-nodes-setup.ts parses it). Keep the
@@ -1771,6 +1771,7 @@ ROUTES = (
     "health",
     "png-text",
     "editor-workflow",
+    "timings",
 )
 ANALYZE_OPS = ("face-distance", "face-boxes", "face-probe", "pose", "person-poses", "duo-counts")
 # An input file younger than this is never deleted, whatever the request says.
@@ -2336,6 +2337,120 @@ def record_usage(key, ok, elapsed_ms):
     entry["ms"] += float(elapsed_ms)
 
 
+class StageTimer:
+    """
+    When each node of each job ran (ENGINE_PLAN.md phase 1): the time it started, its first
+    progress step (a sampler's model is moved to the GPU before it, so start to first step is
+    the load), and when the next node started or the job ended. Fed ComfyUI's own events
+    (execution_start, executing, progress, execution_cached, execution_success / _error /
+    _interrupted) by a wrapper on PromptServer.send_sync, for every job whoever queued it. Keeps
+    the last MAX_JOBS jobs. Times are ms since the epoch.
+    """
+
+    MAX_JOBS = 400
+
+    def __init__(self, clock=None):
+        import threading  # noqa: PLC0415
+        import time  # noqa: PLC0415
+
+        self._clock = clock or (lambda: int(time.time() * 1000))
+        self._lock = threading.Lock()
+        self._jobs = {}
+        self._order = []
+
+    def _job(self, prompt_id):
+        job = self._jobs.get(prompt_id)
+        if job is None:
+            job = {"started": None, "ended": None, "outcome": None, "cached": [], "nodes": []}
+            self._jobs[prompt_id] = job
+            self._order.append(prompt_id)
+            while len(self._order) > self.MAX_JOBS:
+                self._jobs.pop(self._order.pop(0), None)
+        return job
+
+    @staticmethod
+    def _close(job, at):
+        if job["nodes"] and job["nodes"][-1].get("end") is None:
+            job["nodes"][-1]["end"] = at
+
+    def note(self, event, data):
+        """One ComfyUI event (send_sync's event and data); anything not a job's is ignored."""
+        if not isinstance(data, dict):
+            return
+        prompt_id = data.get("prompt_id")
+        if not isinstance(prompt_id, str) or not prompt_id:
+            return
+        at = self._clock()
+        with self._lock:
+            if event == "execution_start":
+                job = self._job(prompt_id)
+                job["started"] = at
+            elif event == "execution_cached":
+                job = self._job(prompt_id)
+                job["cached"] = [str(node) for node in data.get("nodes") or []]
+            elif event == "executing":
+                job = self._job(prompt_id)
+                self._close(job, at)
+                node = data.get("node")
+                if node is not None:
+                    job["nodes"].append({"id": str(node), "start": at, "firstStep": None, "end": None})
+            elif event == "progress":
+                job = self._jobs.get(prompt_id)
+                if job and job["nodes"]:
+                    last = job["nodes"][-1]
+                    if str(data.get("node")) == last["id"] and last["firstStep"] is None:
+                        last["firstStep"] = at
+            elif event in ("execution_success", "execution_error", "execution_interrupted"):
+                job = self._job(prompt_id)
+                self._close(job, at)
+                job["ended"] = at
+                job["outcome"] = event.replace("execution_", "")
+
+    def timings(self, prompt_id):
+        """A job's record (a copy), or None when this ComfyUI didn't see it since it started."""
+        with self._lock:
+            job = self._jobs.get(prompt_id)
+            if job is None:
+                return None
+            return {
+                "promptId": prompt_id,
+                "started": job["started"],
+                "ended": job["ended"],
+                "outcome": job["outcome"],
+                "cached": list(job["cached"]),
+                "nodes": [dict(node) for node in job["nodes"]],
+            }
+
+
+STAGE_TIMER = StageTimer()
+
+
+def hook_stage_timer(server, timer=STAGE_TIMER):
+    """Wrap the server's send_sync so every job event reaches the timer (once)."""
+    original = getattr(server, "send_sync", None)
+    if original is None or getattr(original, "_castcut_timed", False):
+        return False
+
+    def send_sync(event, data, sid=None):
+        try:
+            timer.note(event, data)
+        except Exception:  # noqa: BLE001 - timing never breaks a render
+            pass
+        return original(event, data, sid)
+
+    send_sync._castcut_timed = True
+    server.send_sync = send_sync
+    return True
+
+
+def timings_request(query):
+    prompt_id = str(query.get("prompt_id") or "").strip()
+    if not prompt_id:
+        raise ValueError("prompt_id is required.")
+    found = STAGE_TIMER.timings(prompt_id)
+    return found if found is not None else {"promptId": prompt_id, "unknown": True}
+
+
 def usage_payload():
     return {
         "since": _STARTED,
@@ -2633,10 +2748,17 @@ def register_routes():
             return web.json_response({"error": "JSON body required."}, status=400)
         return await run(editor_workflow_request, body, usage_key="editor-workflow")
 
+    @routes.get(f"{ROUTE_PREFIX}/timings")
+    async def castcut_timings(request):
+        return await run(timings_request, dict(request.query), usage_key="timings")
+
     @routes.get(f"{ROUTE_PREFIX}/health")
     async def castcut_health(_request):
         running, pending = queue_state()
         return await run(health_payload, {"running": len(running), "pending": len(pending)})
+
+    # Every job's node timings (ENGINE_PLAN.md phase 1), whoever queued it.
+    hook_stage_timer(PromptServer.instance)
 
     global _STARTED  # noqa: PLW0603
     import time  # noqa: PLC0415

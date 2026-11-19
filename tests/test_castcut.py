@@ -748,3 +748,71 @@ class Transcribe(unittest.TestCase):
         out = node.transcribe(self._audio(0.3), model="fake")
         self.assertEqual(out["ui"]["castcut_text"], ["Hello."])
         self.assertEqual(out["result"], ("Hello.",))
+
+
+class StageTimerTests(unittest.TestCase):
+    """ENGINE_PLAN.md phase 1: each node's start, first step and end, from ComfyUI's events."""
+
+    def _timer(self):
+        clock = {"now": 1000}
+        timer = castcut.StageTimer(clock=lambda: clock["now"])
+        return timer, clock
+
+    def test_a_job_s_nodes_their_first_step_and_its_end(self):
+        timer, clock = self._timer()
+        steps = [
+            ("execution_start", {"prompt_id": "p1"}, 1000),
+            ("execution_cached", {"prompt_id": "p1", "nodes": ["1", 2]}, 1005),
+            ("executing", {"prompt_id": "p1", "node": "3"}, 1010),
+            ("executing", {"prompt_id": "p1", "node": "5"}, 1400),
+            ("progress", {"prompt_id": "p1", "node": "5", "value": 1, "max": 8}, 4400),
+            ("progress", {"prompt_id": "p1", "node": "5", "value": 2, "max": 8}, 4900),
+            ("executing", {"prompt_id": "p1", "node": "8"}, 9400),
+            ("executing", {"prompt_id": "p1", "node": None}, 9900),
+            ("execution_success", {"prompt_id": "p1"}, 9910),
+        ]
+        for event, data, at in steps:
+            clock["now"] = at
+            timer.note(event, data)
+        job = timer.timings("p1")
+        self.assertEqual(job["started"], 1000)
+        self.assertEqual(job["ended"], 9910)
+        self.assertEqual(job["outcome"], "success")
+        self.assertEqual(job["cached"], ["1", "2"])
+        self.assertEqual(
+            job["nodes"],
+            [
+                {"id": "3", "start": 1010, "firstStep": None, "end": 1400},
+                {"id": "5", "start": 1400, "firstStep": 4400, "end": 9400},
+                {"id": "8", "start": 9400, "firstStep": None, "end": 9900},
+            ],
+        )
+
+    def test_unknown_jobs_other_events_and_the_cap(self):
+        timer, _ = self._timer()
+        self.assertIsNone(timer.timings("nope"))
+        timer.note("status", {"exec_info": {}})  # no prompt_id: ignored
+        timer.note("executing", "not a dict")
+        self.assertEqual(castcut.timings_request({"prompt_id": "nope"}), {"promptId": "nope", "unknown": True})
+        with self.assertRaises(ValueError):
+            castcut.timings_request({})
+        timer.MAX_JOBS = 3
+        for n in range(5):
+            timer.note("execution_start", {"prompt_id": f"j{n}"})
+        self.assertIsNone(timer.timings("j0"))
+        self.assertIsNotNone(timer.timings("j4"))
+
+    def test_the_hook_passes_every_event_on_and_hooks_once(self):
+        timer, _ = self._timer()
+        sent = []
+
+        class Server:
+            def send_sync(self, event, data, sid=None):
+                sent.append((event, sid))
+
+        server = Server()
+        self.assertTrue(castcut.hook_stage_timer(server, timer))
+        self.assertFalse(castcut.hook_stage_timer(server, timer))
+        server.send_sync("execution_start", {"prompt_id": "p9"}, "client-a")
+        self.assertEqual(sent, [("execution_start", "client-a")])
+        self.assertIsNotNone(timer.timings("p9"))
